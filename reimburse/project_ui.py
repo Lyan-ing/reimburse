@@ -276,6 +276,7 @@ class ProjectApp(tk.Tk):
         self.ocr_labels: dict[tuple[str, str], tk.Label] = {}
         self._thumb_refs: dict[str, ImageTk.PhotoImage] = {}
         self._ocr_jobs: set[tuple[str, str, str]] = set()
+        self._asset_vars: dict[str, tk.StringVar] = {}
         self.ui_queue: queue.Queue = queue.Queue()
         self._status_by_label = {v["label"]: k for k, v in STATUSES.items()}
         self._status_labels = [STATUSES[k]["label"] for k in STATUS_ORDER]
@@ -417,14 +418,17 @@ class ProjectApp(tk.Tk):
         line = tk.Frame(title_box, bg=COLORS["bg"])
         line.pack(anchor="w")
         tk.Label(line, text="报销台账", font=("Microsoft YaHei UI", 18, "bold"), fg=COLORS["ink"], bg=COLORS["bg"]).pack(side="left")
-        tk.Label(line, text="v2.0", font=("Microsoft YaHei UI", 8, "bold"), fg=COLORS["accent"], bg=COLORS["chip"], padx=self.px(7), pady=self.px(1)).pack(side="left", padx=(8, 0), pady=(2, 0))
+        tk.Label(line, text="v2.1", font=("Microsoft YaHei UI", 8, "bold"), fg=COLORS["accent"], bg=COLORS["chip"], padx=self.px(7), pady=self.px(1)).pack(side="left", padx=(8, 0), pady=(2, 0))
         tk.Label(title_box, text="半自动整理 · 项目台账 · 历史状态", font=("Microsoft YaHei UI", 9), fg=COLORS["muted"], bg=COLORS["bg"]).pack(anchor="w", pady=(1, 0))
 
         right = tk.Frame(header, bg=COLORS["bg"])
         right.pack(side="right")
         tk.Label(right, textvariable=self.date_var, font=("Consolas", 9), fg=COLORS["muted"], bg=COLORS["bg"]).pack(side="left", padx=(0, 8))
         tk.Label(right, textvariable=self.clock_var, font=("Consolas", 9, "bold"), fg=COLORS["accent"], bg=COLORS["bg"]).pack(side="left", padx=(0, 12))
-        ttk.Button(right, text="📂 台账目录", style="Soft.TButton", command=self.choose_workspace).pack(side="left", padx=(0, 6))
+        self.workspace_btn = ttk.Button(right, text="📂 报销资料管理", style="Soft.TButton", command=self.choose_workspace)
+        self.workspace_btn.pack(side="left", padx=(0, 6))
+        self._set_tooltip(self.workspace_btn, "点击可设置报销数据的存放目录（设置后全局生效，无需每次选择）。")
+        self._update_workspace_btn()
         ttk.Button(right, text="＋ 新建项目", style="Accent.TButton", command=self.new_project).pack(side="left")
 
         tk.Frame(outer, bg=COLORS["accent"], height=max(2, self.px(2))).pack(fill="x", pady=(self.px(9), self.px(10)))
@@ -446,6 +450,39 @@ class ProjectApp(tk.Tk):
         self.content.rowconfigure(0, weight=1)
         self.content.columnconfigure(0, weight=1)
         self._render_empty()
+
+    def _update_workspace_btn(self) -> None:
+        # 顶栏只显示功能名，不直接暴露实际存放路径（路径设置见 choose_workspace）。
+        self.workspace_btn.configure(text="📂 报销资料管理")
+        self._set_tooltip(self.workspace_btn, "点击可设置报销数据的存放目录（设置后全局生效，无需每次选择）。")
+
+    def _set_tooltip(self, widget: tk.Widget, text: str) -> None:
+        def on_enter(_event=None) -> None:
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(
+                tip,
+                text=text,
+                bg="#2D3748",
+                fg="white",
+                font=("Microsoft YaHei UI", 9),
+                justify="left",
+                padx=8,
+                pady=5,
+            ).pack()
+            widget._wb_tip = tip
+
+        def on_leave(_event=None) -> None:
+            tip = getattr(widget, "_wb_tip", None)
+            if tip is not None:
+                tip.destroy()
+                widget._wb_tip = None
+
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
 
     def _build_sidebar(self, parent: tk.Frame) -> None:
         header = tk.Frame(parent, bg=COLORS["panel"])
@@ -640,6 +677,7 @@ class ProjectApp(tk.Tk):
         self.current_record_id = None
         self.settings["workspace_root"] = str(self.workspace_root)
         save_settings(self.settings)
+        self._update_workspace_btn()
         self._refresh_projects()
         self._render_empty()
 
@@ -881,6 +919,7 @@ class ProjectApp(tk.Tk):
         if self.editor_scroll is None or self.project is None:
             return
         self.editor_scroll.clear()
+        self._asset_vars = {}
         record = self._record()
         if record is None:
             tk.Label(
@@ -1008,7 +1047,7 @@ class ProjectApp(tk.Tk):
                 tk.Label(row, text="📄", font=("Segoe UI Emoji", 20), bg="#F8FCFE").grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, self.px(8)))
             info = tk.Frame(row, bg="#F8FCFE")
             info.grid(row=0, column=1, sticky="ew")
-            tk.Label(info, text=asset.display_name, font=("Microsoft YaHei UI", 8), fg=COLORS["ink"], bg="#F8FCFE", anchor="w", wraplength=self.px(250)).pack(anchor="w")
+            tk.Label(info, text=asset.display_name, font=("Microsoft YaHei UI", 8), fg=COLORS["ink"], bg="#F8FCFE", anchor="w", wraplength=self.px(210)).pack(anchor="w")
             meta = f"{asset.source} · {asset.added_at[:16]}"
             if asset.amount:
                 if asset.refund_amount:
@@ -1016,11 +1055,62 @@ class ProjectApp(tk.Tk):
                     meta = f"支付 ¥{asset.amount:,.2f} · 退款 ¥{asset.refund_amount:,.2f} · 净 ¥{net:,.2f} · " + meta
                 else:
                     meta = f"识别到 ¥{asset.amount:,.2f} · " + meta
-            tk.Label(info, text=meta, font=("Microsoft YaHei UI", 7), fg=COLORS["muted"], bg="#F8FCFE").pack(anchor="w")
+            # wraplength 让过长的 meta 自动换行，避免被右侧“查看/删除”列截断遮挡
+            tk.Label(info, text=meta, font=("Microsoft YaHei UI", 7), fg=COLORS["muted"], bg="#F8FCFE", anchor="w", wraplength=self.px(210)).pack(anchor="w")
             actions = tk.Frame(row, bg="#F8FCFE")
-            actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=(self.px(8), 0))
-            ttk.Button(actions, text="查看", style="Soft.TButton", command=lambda a=asset: self.open_asset(a)).pack(side="left", padx=(0, 4))
-            ttk.Button(actions, text="删除", style="Danger.TButton", command=lambda a=asset, k=key: self.delete_asset(record, k, a)).pack(side="left")
+            actions.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(self.px(8), 0))
+            ttk.Button(actions, text="查看", style="Soft.TButton", command=lambda a=asset: self.open_asset(a)).grid(row=0, column=0, padx=(0, 4), pady=(0, self.px(4)))
+            ttk.Button(actions, text="删除", style="Danger.TButton", command=lambda a=asset, k=key: self.delete_asset(record, k, a)).grid(row=0, column=1, pady=(0, self.px(4)))
+            if key == "payment":
+                self._build_payment_amount_editor(record, asset, actions)
+
+    def _build_payment_amount_editor(self, record: Record, asset: Asset, actions: tk.Frame) -> None:
+        # 金额输入框放在「查看」正下方、计算按钮放在「删除」正下方，二者并列，
+        # 与上方 查看/删除 共用 actions 的两列网格，排版保持一致；不再显示“已手改”。
+        var = tk.StringVar(value=f"{asset.amount:.2f}" if asset.amount is not None else "")
+        entry = ttk.Entry(actions, textvariable=var, width=6)
+        entry.grid(row=1, column=0, sticky="w", padx=(0, 4))
+        self._set_tooltip(entry, "支付金额：可手动修改，或点右侧「计算」")
+        self._asset_vars[asset.id] = var
+
+        def commit(_event=None) -> None:
+            self._save_asset_amount(record, asset, var.get())
+
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Return>", lambda e: (commit(), "break"))
+
+        ttk.Button(
+            actions,
+            text="🧮 计算",
+            style="Soft.TButton",
+            command=lambda r=record, a=asset, v=var: self._open_calculator(r, a, v),
+        ).grid(row=1, column=1, sticky="e")
+
+    def _save_asset_amount(self, record: Record, asset: Asset, value: str) -> None:
+        if not self.project or self.project.find_record(record.id) is None:
+            return
+        new_amount = self._parse_amount(value)
+        asset.amount = new_amount
+        asset.amount_manual = new_amount is not None
+        # 手动改过某笔支付后，记录总支付金额按各笔净额重新自动合计。
+        record.payment_manual = False
+        record.refresh_payment_total()
+        record.updated_at = datetime.now().isoformat(timespec="seconds")
+        self.project.save()
+        if self._record() is record:
+            self._render_editor()
+            self._render_records()
+        self._refresh_stats_only()
+
+    def _open_calculator(self, record: Record, asset: Asset, var: tk.StringVar) -> None:
+        initial = asset.amount if asset.amount is not None else 0.0
+
+        def on_apply(result: float) -> None:
+            text = f"{result:.2f}"
+            var.set(text)
+            self._save_asset_amount(record, asset, text)
+
+        CalculatorWindow(self, initial, on_apply)
 
     def save_fields(self, record: Record) -> None:
         if not self.project or self.project.find_record(record.id) is None:
@@ -1327,10 +1417,10 @@ class ProjectApp(tk.Tk):
         elif slot == "payment":
             asset = next((a for a in record.slot_assets("payment") if a.id == asset_id), None)
             if asset is not None:
-                if data.get("amount"):
+                if data.get("amount") and not asset.amount_manual:
                     asset.amount = data["amount"]
                     changed = True
-                if data.get("refund"):
+                if data.get("refund") and not asset.amount_manual:
                     asset.refund_amount = data["refund"]
                     changed = True
             before = record.payment_amount
@@ -1396,5 +1486,280 @@ class ProjectApp(tk.Tk):
                 os.startfile(str(generated))
             except Exception as exc:
                 messagebox.showerror("打开失败", str(exc), parent=self)
+
+
+def _safe_eval(expr: str) -> float:
+    """Evaluate a small arithmetic expression with only + - * / and unary minus.
+
+    Uses the ast module so no arbitrary code can run. Raises ValueError on
+    anything it does not recognise (e.g. division by zero, letters).
+    """
+    import ast
+
+    node = ast.parse(expr, mode="eval")
+
+    def _eval(n) -> float:
+        if isinstance(n, ast.Expression):
+            return _eval(n.body)
+        if isinstance(n, ast.Constant):
+            if isinstance(n.value, (int, float)):
+                return float(n.value)
+            raise ValueError("unsupported constant")
+        if isinstance(n, ast.UnaryOp):
+            value = _eval(n.operand)
+            if isinstance(n.op, ast.USub):
+                return -value
+            if isinstance(n.op, ast.UAdd):
+                return value
+            raise ValueError("unsupported unary op")
+        if isinstance(n, ast.BinOp):
+            left = _eval(n.left)
+            right = _eval(n.right)
+            if isinstance(n.op, ast.Add):
+                return left + right
+            if isinstance(n.op, ast.Sub):
+                return left - right
+            if isinstance(n.op, ast.Mult):
+                return left * right
+            if isinstance(n.op, ast.Div):
+                return left / right
+            raise ValueError("unsupported binary op")
+        raise ValueError("unsupported expression")
+
+    return _eval(node)
+
+
+# 键盘按键 -> 计算器表达式 token。半角 "-" 及各种 Unicode/全角减号统一映射为
+# 与 UI 按钮一致的 "−"（U+2212），否则 _append 依据 {"+", "−", "×", "÷"} 的
+# 连打运算符判断会失效。keysym 兜底项覆盖个别平台 event.char 为空的情况。
+_FULLWIDTH_TO_HALF = str.maketrans("０１２３４５６７８９＋－＊／．", "0123456789+-*/.")
+_KEY_TO_TOKEN: dict[str, str] = {
+    ".": ".",
+    "+": "+",
+    "-": "−",
+    "−": "−",
+    "*": "×",
+    "/": "÷",
+    "×": "×",
+    "÷": "÷",
+    # keysym 兜底（个别平台 event.char 可能为空）
+    "period": ".",
+    "plus": "+",
+    "minus": "−",
+    "asterisk": "×",
+    "slash": "÷",
+    # 小键盘
+    "KP_Decimal": ".",
+    "KP_Separator": ".",
+    "KP_Add": "+",
+    "KP_Subtract": "−",
+    "KP_Multiply": "×",
+    "KP_Divide": "÷",
+}
+_KEY_TO_TOKEN.update({str(digit): str(digit) for digit in range(10)})
+_KEY_TO_TOKEN.update({f"KP_{digit}": str(digit) for digit in range(10)})
+
+
+class CalculatorWindow(tk.Toplevel):
+    """A tiny modal calculator for working out a payment amount by hand.
+
+    Intended for cases like a single ride-hailing invoice that bundles several
+    trips plus a discount: the user types e.g. ``6.8 + 9.5 - 2`` and the result
+    is written back as that payment asset's amount.
+    """
+
+    def __init__(self, parent: tk.Widget, initial: float, on_apply):
+        super().__init__(parent)
+        self.on_apply = on_apply
+        self.expr = f"{initial:.2f}" if initial not in (None, 0) else ""
+        self.value: float | None = None
+        # 上一次求值是否失败：失败时 _refresh_display 保留「计算错误」提示，
+        # 不被原始表达式覆盖；用户做任何非求值输入时清除。
+        self._eval_failed = False
+        self.title("金额计算")
+        self.configure(bg=COLORS["bg"])
+        self.resizable(False, False)
+        self.transient(parent)
+        self._build()
+        # 先布局，再按内容实际尺寸显式给定窗口大小并居中于主窗口之上。
+        # grab_set 放在 _build 之后：即便 _build 中途抛错，也不会把主窗口永久锁死；
+        # 显式尺寸可避免 transient + 无尺寸 geometry 在 Windows 上尺寸塌缩成空白。
+        self.update_idletasks()
+        w = max(280, self.winfo_reqwidth() + 24)
+        h = max(340, self.winfo_reqheight() + 24)
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - w) // 2)
+        y = parent.winfo_rooty() + 60
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.grab_set()
+        self.focus_set()
+        # 键盘输入：grab_set 后键盘事件直达本 Toplevel；即便焦点落在窗口内的
+        # 按钮上，按键也会沿 bindtags 冒泡到这里，保证随时可用键盘敲数字/运算符。
+        self.bind("<Key>", self._on_keyboard)
+        self.wait_window(self)
+
+    def _build(self) -> None:
+        pad = 8
+        display = tk.Label(
+            self,
+            text=self.expr or "0",
+            font=("Consolas", 18, "bold"),
+            fg=COLORS["accent"],
+            bg="white",
+            anchor="e",
+            relief="solid",
+            bd=1,
+            padx=pad,
+            pady=pad,
+        )
+        display.pack(fill="x", padx=pad, pady=(pad, 4))
+        self._display = display
+
+        grid = tk.Frame(self, bg=COLORS["bg"])
+        grid.pack(padx=pad, pady=(0, pad))
+
+        keys = [
+            ("7", "8", "9", "÷"),
+            ("4", "5", "6", "×"),
+            ("1", "2", "3", "−"),
+            ("0", ".", "=", "+"),
+            ("C", "⌫", "+/−"),
+        ]
+        for r, row_keys in enumerate(keys):
+            for c, key in enumerate(row_keys):
+                cmd = self._on_key(key)
+                btn = tk.Button(
+                    grid,
+                    text=key,
+                    width=4,
+                    height=2,
+                    font=("Microsoft YaHei UI", 11, "bold"),
+                    bg=COLORS["soft"] if key in {"C", "⌫", "+/−"} else "white",
+                    fg=COLORS["ink"],
+                    relief="flat",
+                    activebackground=COLORS["accent"],
+                    activeforeground="white",
+                    command=cmd,
+                )
+                btn.grid(row=r, column=c, padx=3, pady=3)
+        apply_btn = tk.Button(
+            self,
+            text="填入金额",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            bg=COLORS["accent"],
+            fg="white",
+            relief="flat",
+            padx=pad,
+            pady=pad,
+            command=self._apply,
+        )
+        apply_btn.pack(fill="x", padx=pad, pady=(4, pad))
+
+    def _on_key(self, key: str):
+        def handler() -> None:
+            if key != "=":
+                # 求值失败的错误提示只在再次求值时延续，其它输入一律清除
+                self._eval_failed = False
+            if key == "C":
+                self.expr = ""
+            elif key == "⌫":
+                self.expr = self.expr[:-1]
+            elif key == "+/−":
+                if self.expr.startswith("-"):
+                    self.expr = self.expr[1:]
+                elif self.expr and self.expr != "0":
+                    self.expr = "-" + self.expr
+            elif key == "=":
+                self._evaluate()
+            else:
+                self._append(key)
+            self._refresh_display()
+        return handler
+
+    def _on_keyboard(self, event) -> str:
+        """计算器窗口的键盘统一处理入口（绑定于 ``<Key>``）。
+
+        - 数字 0-9 与 "." → 追加到表达式；
+        - "+" / "-" / "*" / "/" → 追加为 "+" / "−" / "×" / "÷"（与 UI 按钮一致）；
+        - Return / KP_Enter / "=" → 求值（等同按 "="）；
+        - BackSpace → 删掉最后一个字符；Escape → 关闭窗口；c / C → 清空。
+
+        处理完刷新显示并返回 "break"，阻止事件继续向其它控件传播。
+        """
+        keysym = getattr(event, "keysym", "") or ""
+        char = getattr(event, "char", "") or ""
+
+        # 功能键优先用 keysym 判定：这类按键的 event.char 通常为空或不可打印。
+        is_eval = keysym in ("Return", "KP_Enter") or char == "=" or keysym == "equal"
+        if not is_eval:
+            # 求值失败的错误提示只在再次求值时延续，其它输入一律清除
+            self._eval_failed = False
+        if is_eval:
+            self._evaluate()
+        elif keysym == "BackSpace":
+            self.expr = self.expr[:-1]
+        elif keysym == "Escape":
+            self.destroy()
+            return "break"
+        elif keysym in ("c", "C") or char in ("c", "C"):
+            self.expr = ""
+        else:
+            token = self._key_to_token(keysym, char)
+            if token is not None:
+                self._append(token)
+        self._refresh_display()
+        return "break"
+
+    @staticmethod
+    def _key_to_token(keysym: str, char: str) -> str | None:
+        """把一次按键翻译成表达式 token；无法识别的按键返回 None。"""
+        # 全角数字/运算符兼容：先归一为半角再查表。
+        if char:
+            normalized = char.translate(_FULLWIDTH_TO_HALF)
+            if normalized in _KEY_TO_TOKEN:
+                return _KEY_TO_TOKEN[normalized]
+        if keysym in _KEY_TO_TOKEN:
+            return _KEY_TO_TOKEN[keysym]
+        return None
+
+    def _append(self, key: str) -> None:
+        if key in {"+", "−", "×", "÷"}:
+            if not self.expr or self.expr[-1] in {"+", "−", "×", "÷", "-"}:
+                return
+        self.expr += key
+
+    def _evaluate(self) -> None:
+        raw = self.expr.replace("×", "*").replace("−", "-").replace("÷", "/")
+        if not raw:
+            return
+        try:
+            result = _safe_eval(raw)
+        except Exception:
+            self.value = None
+            self._eval_failed = True
+            self._display.configure(text="计算错误", fg=COLORS["error"])
+            return
+        self.value = round(result, 2)
+        self.expr = f"{self.value:.2f}"
+        self._eval_failed = False
+        self._display.configure(fg=COLORS["accent"])
+
+    def _refresh_display(self) -> None:
+        if self._eval_failed:
+            # 保留 _evaluate 写入的「计算错误」提示，避免被原始表达式覆盖
+            return
+        self._display.configure(text=self.expr or "0", fg=COLORS["accent"])
+
+    def _apply(self) -> None:
+        if self.value is None:
+            self._evaluate()
+        if self.value is None:
+            self._display.configure(text="计算错误", fg=COLORS["error"])
+            return
+        try:
+            self.on_apply(self.value)
+        except Exception as exc:  # 写入金额 / 重绘编辑器出错时提示，不让窗口静默卡死
+            messagebox.showerror("写入失败", str(exc), parent=self)
+            return
+        self.destroy()
 
 

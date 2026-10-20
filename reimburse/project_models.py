@@ -125,6 +125,7 @@ class Asset:
     page_count: int = 0
     amount: float | None = None
     refund_amount: float | None = None
+    amount_manual: bool = False
     note: str = ""
 
     def path(self, project_folder: Path) -> Path:
@@ -144,6 +145,7 @@ class Asset:
             "page_count": self.page_count,
             "amount": self.amount,
             "refund_amount": self.refund_amount,
+            "amount_manual": self.amount_manual,
             "note": self.note,
         }
 
@@ -158,6 +160,7 @@ class Asset:
             page_count=int(data.get("page_count", 0) or 0),
             amount=_float_or_none(data.get("amount")),
             refund_amount=_float_or_none(data.get("refund_amount")),
+            amount_manual=bool(data.get("amount_manual", False)),
             note=data.get("note", ""),
         )
 

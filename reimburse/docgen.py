@@ -506,31 +506,35 @@ def build_document(result: ScanResult, output_path: Path) -> Path:
         doc.core_properties.subject = result.event_name
 
         pages: list[tuple[str, list[ImageBlock], bool]] = []
-        # Build full-width invoice pages by section, then payments, then notices.
+        # 按费用类别（section）分块：每一类先排“证据”（发票/行程单/路桥/照片等；_blocks_for_group
+        # 已跳过支付记录，且打车类的行程单会与发票合并同页），紧接着排这一类的“支付记录”（两列）；
+        # 证据与支付记录之间自动分页（不同 pages 条目间插入分页符），同类证据 / 同类支付可同页；
+        # 一类排完接着排下一类。录用通知放在最后。
         for section_name in ("traffic", "hotel", "taxi", "other"):
             section_groups = [g for g in result.groups if g.section == section_name]
-            blocks: list[ImageBlock] = []
-            for group in section_groups:
-                blocks.extend(_blocks_for_group(group, renderer))
-            if blocks:
-                for page in _pack_full_blocks(blocks):
-                    pages.append((section_name, page, True))
-
-        # Payment screenshots use a two-column layout, ordered by their invoice group.
-        payment_blocks: list[ImageBlock] = []
-        for payment in result.ordered_payments:
-            if not payment.include or payment.duplicate:
+            if not section_groups:
                 continue
-            for page_image in renderer.pages(payment):
-                payment_blocks.append(_make_half_block(page_image, label=payment.group_id))
-        if payment_blocks:
-            for page in _pack_half_blocks(payment_blocks):
-                flat = [block for row in page for block in row]
-                pages.append(("payment", flat, False))
+            material_blocks: list[ImageBlock] = []
+            for group in section_groups:
+                material_blocks.extend(_blocks_for_group(group, renderer))
+            if material_blocks:
+                for page in _pack_full_blocks(material_blocks):
+                    pages.append((section_name, page, True))
+            payment_blocks: list[ImageBlock] = []
+            for group in section_groups:
+                for payment in group.payments:
+                    if not payment.include or payment.duplicate:
+                        continue
+                    for page_image in renderer.pages(payment):
+                        payment_blocks.append(_make_half_block(page_image, label=group.gid))
+            if payment_blocks:
+                for page in _pack_half_blocks(payment_blocks):
+                    flat = [block for row in page for block in row]
+                    pages.append(("payment", flat, False))
 
-        notice_groups = [g for g in result.groups if g.section == "notice"]
+        # 录用通知放在最后。
         notice_blocks: list[ImageBlock] = []
-        for group in notice_groups:
+        for group in [g for g in result.groups if g.section == "notice"]:
             notice_blocks.extend(_blocks_for_group(group, renderer))
         if notice_blocks:
             for page in _pack_full_blocks(notice_blocks):
