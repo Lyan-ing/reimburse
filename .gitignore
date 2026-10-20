@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+*.zip
+
+# Local reimbursement data and generated test output
+samples/
+analysis_docs/
+tests/
+.dsh-office-*/
+.workbuddy/
+*.log
+*.tmp
+
+# Local build and one-off analysis scripts
+build.ps1
+analyze_reimburse_docs.py
+extract_docx_media.py
+list_media_types.py
+make_contact_sheets.py
+summarize_media_ocr.py
+
+# Documents and images generated during testing
+*.docx
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tif
+*.tiff
+
+# Keep the application icon in the repository
+!assets/app.ico
+!assets/app.png
+
+# Local configuration
+.env
+*.local
