@@ -9,6 +9,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .config import load_settings, save_settings
+from .appearance import COLORS, apply_window_icon, enable_dpi_awareness
 from .docgen import build_document, default_filename
 from .models import (
     EVENT_TYPES,
@@ -24,34 +25,7 @@ SECTION_BY_LABEL = {v: k for k, v in SECTION_NAMES.items()}
 ROLE_BY_LABEL = {v: k for k, v in ROLE_NAMES.items()}
 ROLE_LABELS = list(ROLE_NAMES.values())
 
-COLORS = {
-    "bg": "#EEF7FB",
-    "panel": "#FFFFFF",
-    "ink": "#24373F",
-    "muted": "#5B7280",
-    "accent": "#3E9AA8",
-    "accent_hover": "#2F7F8C",
-    "sky": "#4A9BD4",
-    "leaf": "#6FB56B",
-    "clay": "#D9A15F",
-    "line": "#C9DEE7",
-    "error": "#B23A3A",
-    "warn": "#B7791F",
-    "info": "#3B6E8F",
-    "group": "#E8F4F8",
-    "soft": "#EAF4F7",
-    "chip": "#E3F1F4",
-}
 LEVEL_LABEL = {"error": "必须补充", "warn": "建议核对", "info": "提示"}
-
-
-def enable_dpi_awareness() -> None:
-    try:
-        import ctypes
-
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
 
 
 def parse_date_entry(value: str) -> date | None:
@@ -182,6 +156,7 @@ class EditDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        apply_window_icon(self)
         self.settings = load_settings()
         self.title("报销材料整理助手")
         self.ui_scale = max(1.0, self.winfo_fpixels("1i") / 96.0)

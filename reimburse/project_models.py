@@ -17,9 +17,8 @@ STATUSES: dict[str, dict[str, str]] = {
     "materials_ready": {"label": "已整理好材料", "color": "#3E9AA8", "bg": "#E3F1F4"},
     "printed": {"label": "已打印提交", "color": "#4A6FA5", "bg": "#E8EEF9"},
     "completed": {"label": "已报销完成", "color": "#5B8C5A", "bg": "#EAF5E8"},
-    "archived": {"label": "已归档", "color": "#6B7280", "bg": "#F0F2F5"},
 }
-STATUS_ORDER = ["draft", "materials_ready", "printed", "completed", "archived"]
+STATUS_ORDER = ["draft", "materials_ready", "printed", "completed"]
 
 SLOT_LABELS = {
     "invoice": "发票",
@@ -234,7 +233,7 @@ class Record:
         if self.amount is None or self.amount <= 0:
             if self.has_slot("invoice"):
                 missing.append(("amount", "发票金额", "warn"))
-        if self.payment_amount is None or self.payment_amount <= 0:
+        if self.payment_amount is None or self.payment_amount < 0:
             if self.has_slot("payment"):
                 missing.append(("payment_amount", "支付金额", "warn"))
         return missing
@@ -242,7 +241,7 @@ class Record:
     def payment_asset_sum(self) -> float:
         total = 0.0
         for asset in self.slot_assets("payment"):
-            if asset.amount is None or asset.amount <= 0:
+            if asset.amount is None or asset.amount < 0:
                 continue
             total += asset.amount - (asset.refund_amount or 0.0)
         return round(total, 2)
@@ -250,9 +249,9 @@ class Record:
     def refresh_payment_total(self) -> None:
         if self.payment_manual:
             return
-        total = self.payment_asset_sum()
-        if total > 0:
-            self.payment_amount = total
+        # Unknown amounts and a confirmed zero net payment have different meanings.
+        known = any(a.amount is not None for a in self.slot_assets("payment"))
+        self.payment_amount = self.payment_asset_sum() if known else None
 
     def apply_ocr_date(self, value: str) -> bool:
         if not value or self.date_manual:
@@ -279,11 +278,15 @@ class Record:
 
     @property
     def effective_amount(self) -> float:
-        if self.has_slot("payment") and self.payment_amount is not None and self.payment_amount > 0:
+        if self.has_slot("payment") and self.payment_amount is not None:
             return round(self.payment_amount, 2)
         if self.amount is not None:
             return round(self.amount, 2)
         return 0.0
+
+    @property
+    def uses_invoice_fallback(self) -> bool:
+        return (not self.has_slot("payment") or self.payment_amount is None) and (self.amount or 0) > 0
 
     @property
     def all_assets(self) -> list[Asset]:
@@ -418,8 +421,7 @@ class Project:
         return sum(
             1
             for record in self.records
-            if (record.payment_amount is None or record.payment_amount <= 0)
-            and (record.amount or 0) > 0
+            if record.uses_invoice_fallback
         )
 
     def missing_reminders(self) -> list[ProjectReminder]:

@@ -5,8 +5,6 @@ import sys
 from pathlib import Path
 
 from reimburse import __version__
-from reimburse.docgen import build_document, default_filename
-from reimburse.pipeline import run_scan
 
 
 def _enable_stdout_utf8() -> None:
@@ -30,6 +28,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.selftest:
+        from reimburse.docgen import build_document, default_filename
+        from reimburse.pipeline import run_scan
+
         folder = Path(args.selftest).resolve()
         if not folder.exists() or not folder.is_dir():
             print(f"文件夹不存在：{folder}", file=sys.stderr)
@@ -49,10 +50,13 @@ def main() -> int:
         print(f"Word：{generated}")
         return 0
 
-    from reimburse.ui import App, enable_dpi_awareness
+    from reimburse.appearance import enable_dpi_awareness, set_app_identity
 
+    set_app_identity()
     enable_dpi_awareness()
     if args.legacy:
+        from reimburse.ui import App
+
         app = App()
     else:
         from reimburse.project_ui import ProjectApp

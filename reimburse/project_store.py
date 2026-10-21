@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,20 @@ class Workspace:
         self.errors = []
         self.root.mkdir(parents=True, exist_ok=True)
         seen: set[Path] = set()
-        for meta in sorted(self.root.rglob("project.json")):
+        # Prune before traversal: old rglob walked every receipt/output/trash file.
+        metadata = []
+        for directory, children, files in os.walk(self.root, followlinks=False):
+            relative = Path(directory).relative_to(self.root)
+            depth = len(relative.parts)
+            children[:] = sorted(
+                child for child in children
+                if depth < 3 and not child.startswith(".")
+                and child not in {"_回收站", "_trash", "assets", "output"}
+                and not (Path(directory) / child).is_symlink()
+            )
+            if "project.json" in files:
+                metadata.append(Path(directory) / "project.json")
+        for meta in sorted(metadata):
             try:
                 rel_parts = meta.parent.relative_to(self.root).parts
             except ValueError:

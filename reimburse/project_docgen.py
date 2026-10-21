@@ -104,9 +104,7 @@ def to_scan_result(project: Project) -> ScanResult:
                     group.photos.append(material)
         if group.materials:
             groups.append(group)
-        if record.has_slot("invoice") and (
-            not record.has_slot("payment") or (record.payment_amount or 0) <= 0
-        ):
+        if record.uses_invoice_fallback:
             fallback_count += 1
 
         # Conference acceptance notices are a separate section in the Word file.
@@ -178,14 +176,18 @@ def project_filename(project: Project) -> str:
     return "_".join(parts) + ".docx"
 
 
-def build_project_document(project: Project, output_path: Path | None = None) -> Path:
+def build_project_document(project: Project, output_path: Path | None = None, *, save_metadata: bool = True) -> Path:
     project.ensure_dirs()
     result = to_scan_result(project)
     path = output_path or (project.output_dir / project_filename(project))
     path = unique_output_path(path)
     generated = build_document(result, path)
-    rel = str(generated.relative_to(project.folder)).replace("\\", "/")
-    if rel not in project.outputs:
-        project.outputs.append(rel)
-    project.save()
+    if save_metadata:
+        try:
+            rel = generated.relative_to(project.folder).as_posix()
+        except ValueError:
+            rel = str(generated)
+        if rel not in project.outputs:
+            project.outputs.append(rel)
+        project.save()
     return generated

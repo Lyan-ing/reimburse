@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import math
 import queue
 import re
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from collections import OrderedDict
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -14,12 +16,10 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 from .capture import ScreenCapturer, clipboard_files, clipboard_image
-from .classify import classify
+from . import __version__, updater
+from .appearance import COLORS, apply_window_icon, enable_dpi_awareness
 from .config import load_settings, save_settings
-from .extract import Extractor
 from .models import SECTION_NAMES
-from .parser import parse_material
-from .project_docgen import build_project_document, project_filename
 from .project_models import (
     PROJECT_TYPES,
     RECORD_TEMPLATES,
@@ -34,7 +34,6 @@ from .project_models import (
     sanitize_filename,
 )
 from .project_store import Workspace
-from .ui import COLORS, enable_dpi_awareness
 
 
 APP_TITLE = "报销台账"
@@ -94,7 +93,7 @@ def prepare_dialog(dialog: tk.Toplevel, parent: tk.Misc, width: int, height: int
 class ScrollFrame(tk.Frame):
     def __init__(self, parent, bg: str = COLORS["panel"]):
         super().__init__(parent, bg=bg)
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0, width=1, height=1)
         self.scroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.body = tk.Frame(self.canvas, bg=bg)
         self.window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
@@ -105,8 +104,10 @@ class ScrollFrame(tk.Frame):
         self.columnconfigure(0, weight=1)
         self.body.bind("<Configure>", self._on_body_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind("<Enter>", self._bind_wheel)
-        self.canvas.bind("<Leave>", self._unbind_wheel)
+        top = self.winfo_toplevel()
+        if not getattr(top, "_scroll_router_installed", False):
+            top.bind("<MouseWheel>", self._route_wheel, add="+")
+            top._scroll_router_installed = True
 
     def _on_body_configure(self, _event=None) -> None:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -114,15 +115,16 @@ class ScrollFrame(tk.Frame):
     def _on_canvas_configure(self, event) -> None:
         self.canvas.itemconfigure(self.window, width=event.width)
 
-    def _bind_wheel(self, _event=None) -> None:
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
-
-    def _unbind_wheel(self, _event=None) -> None:
-        self.canvas.unbind_all("<MouseWheel>")
-
-    def _on_wheel(self, event) -> None:
-        delta = -1 if event.delta > 0 else 1
-        self.canvas.yview_scroll(delta * 3, "units")
+    @staticmethod
+    def _route_wheel(event):
+        widget = event.widget.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if isinstance(widget, ScrollFrame):
+                if event.delta and widget.canvas.yview() != (0.0, 1.0):
+                    units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+                    widget.canvas.yview_scroll(units * 3, "units")
+                return "break"
+            widget = widget.master
 
     def clear(self) -> None:
         for child in self.body.winfo_children():
@@ -245,6 +247,7 @@ class AddRecordDialog(tk.Toplevel):
 class ProjectApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        apply_window_icon(self)
         self.settings = load_settings()
         self.title(APP_TITLE)
         self.ui_scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
@@ -274,8 +277,14 @@ class ProjectApp(tk.Tk):
         self.content: tk.Frame | None = None
         self.field_vars: dict[str, tk.StringVar] = {}
         self.ocr_labels: dict[tuple[str, str], tk.Label] = {}
-        self._thumb_refs: dict[str, ImageTk.PhotoImage] = {}
-        self._ocr_jobs: set[tuple[str, str, str]] = set()
+        self._thumb_refs: OrderedDict[str, ImageTk.PhotoImage] = OrderedDict()
+        self._editor_cache = OrderedDict()
+        self._record_cards = {}
+        self._asset_meta_labels = {}
+        self._search_job = None
+        self._update_check_running = False
+        self._generating = False
+        self._ocr_jobs: set[tuple[str, str, str, str]] = set()
         self._asset_vars: dict[str, tk.StringVar] = {}
         self.ui_queue: queue.Queue = queue.Queue()
         self._status_by_label = {v["label"]: k for k, v in STATUSES.items()}
@@ -339,6 +348,8 @@ class ProjectApp(tk.Tk):
             focusthickness=0,
         )
         style.map("Soft.TButton", background=[("active", "#D7ECEF"), ("pressed", "#CDE5E9")])
+        style.configure("Compact.TButton", font=("Microsoft YaHei UI", 9), foreground=COLORS["ink"], background=COLORS["soft"], borderwidth=0, width=0, padding=(self.px(8), self.px(5)), focusthickness=0)
+        style.map("Compact.TButton", background=[("active", "#D7ECEF")])
         style.configure(
             "Danger.TButton",
             font=("Microsoft YaHei UI", 9),
@@ -358,6 +369,17 @@ class ProjectApp(tk.Tk):
             darkcolor=COLORS["line"],
             padding=self.px(7),
         )
+        # 支付金额输入框：字体/内边距与 Soft 按钮对齐，实测高度与按钮一致(29px)，四格整齐
+        style.configure(
+            "PayAmount.TEntry",
+            font=("Microsoft YaHei UI", 9),
+            fieldbackground="white",
+            foreground=COLORS["ink"],
+            bordercolor=COLORS["line"],
+            lightcolor=COLORS["line"],
+            darkcolor=COLORS["line"],
+            padding=(self.px(4), self.px(4)),
+        )
         style.configure(
             "TCombobox",
             fieldbackground="white",
@@ -369,6 +391,20 @@ class ProjectApp(tk.Tk):
             padding=self.px(5),
         )
         style.map("TCombobox", fieldbackground=[("readonly", "white")], foreground=[("readonly", COLORS["ink"])])
+        # 项目状态下拉：白底加粗 + 主题色边框，醒目易辨
+        style.configure(
+            "Status.TCombobox",
+            fieldbackground="white",
+            background="white",
+            foreground=COLORS["ink"],
+            bordercolor=COLORS["accent"],
+            lightcolor=COLORS["accent"],
+            darkcolor=COLORS["accent"],
+            arrowcolor=COLORS["accent"],
+            padding=(self.px(6), self.px(6)),
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        style.map("Status.TCombobox", fieldbackground=[("readonly", "white")], foreground=[("readonly", COLORS["ink"])])
         style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["muted"], font=("Microsoft YaHei UI", 9))
         style.map("TCheckbutton", background=[("active", COLORS["bg"])], foreground=[("active", COLORS["ink"])])
         style.configure("Horizontal.TProgressbar", troughcolor="#DDEFF2", background=COLORS["accent"], borderwidth=0)
@@ -388,6 +424,10 @@ class ProjectApp(tk.Tk):
                 if item[0] == "ocr":
                     _, project_id, record_id, slot, asset_id, data, error = item
                     self._apply_ocr(project_id, record_id, slot, asset_id, data, error)
+                elif item[0] == "update_checked":
+                    self._on_update_checked(item[1], item[2])
+                elif item[0] == "word_done":
+                    self._on_word_generated(*item[1:])
         except queue.Empty:
             pass
         except tk.TclError:
@@ -412,19 +452,27 @@ class ProjectApp(tk.Tk):
         header.pack(fill="x")
         brand = tk.Frame(header, bg=COLORS["bg"])
         brand.pack(side="left")
-        tk.Label(brand, text="🧾", font=("Segoe UI Emoji", 24), bg=COLORS["bg"]).pack(side="left")
+        tk.Label(brand, image=getattr(self, "_app_icon", ""), text="🧾" if not hasattr(self, "_app_icon") else "", font=("Segoe UI Emoji", 24), bg=COLORS["bg"]).pack(side="left")
         title_box = tk.Frame(brand, bg=COLORS["bg"])
         title_box.pack(side="left", padx=(10, 0))
         line = tk.Frame(title_box, bg=COLORS["bg"])
         line.pack(anchor="w")
         tk.Label(line, text="报销台账", font=("Microsoft YaHei UI", 18, "bold"), fg=COLORS["ink"], bg=COLORS["bg"]).pack(side="left")
-        tk.Label(line, text="v2.1", font=("Microsoft YaHei UI", 8, "bold"), fg=COLORS["accent"], bg=COLORS["chip"], padx=self.px(7), pady=self.px(1)).pack(side="left", padx=(8, 0), pady=(2, 0))
+        tk.Label(line, text=f"v{__version__}", font=("Microsoft YaHei UI", 8, "bold"), fg=COLORS["accent"], bg=COLORS["chip"], padx=self.px(7), pady=self.px(1)).pack(side="left", padx=(8, 0), pady=(2, 0))
         tk.Label(title_box, text="半自动整理 · 项目台账 · 历史状态", font=("Microsoft YaHei UI", 9), fg=COLORS["muted"], bg=COLORS["bg"]).pack(anchor="w", pady=(1, 0))
 
         right = tk.Frame(header, bg=COLORS["bg"])
         right.pack(side="right")
         tk.Label(right, textvariable=self.date_var, font=("Consolas", 9), fg=COLORS["muted"], bg=COLORS["bg"]).pack(side="left", padx=(0, 8))
         tk.Label(right, textvariable=self.clock_var, font=("Consolas", 9, "bold"), fg=COLORS["accent"], bg=COLORS["bg"]).pack(side="left", padx=(0, 12))
+        toolbar = tk.Frame(outer, bg=COLORS["bg"])
+        toolbar.pack(fill="x", pady=(self.px(12), self.px(2)))
+        tk.Label(toolbar, text="工作台", font=("Microsoft YaHei UI", 10, "bold"), fg=COLORS["muted"], bg=COLORS["bg"]).pack(side="left")
+        right = tk.Frame(toolbar, bg=COLORS["bg"])
+        right.pack(side="right")
+        self.update_button = ttk.Button(right, text="🔄 软件更新", style="Soft.TButton", command=self._check_update_ui)
+        self.update_button.pack(side="left", padx=(0, 6))
+        ttk.Button(right, text="❓ 使用说明", style="Soft.TButton", command=self._show_usage).pack(side="left", padx=(0, 6))
         self.workspace_btn = ttk.Button(right, text="📂 报销资料管理", style="Soft.TButton", command=self.choose_workspace)
         self.workspace_btn.pack(side="left", padx=(0, 6))
         self._set_tooltip(self.workspace_btn, "点击可设置报销数据的存放目录（设置后全局生效，无需每次选择）。")
@@ -438,11 +486,11 @@ class ProjectApp(tk.Tk):
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        sidebar_outer, sidebar = self._card(body, pad=self.px(10))
+        sidebar_outer, sidebar = self._card(body, pad=10)
         sidebar_outer.grid(row=0, column=0, sticky="nsw", padx=(0, self.px(10)))
-        sidebar_outer.configure(width=self.px(278))
-        sidebar_outer.grid_propagate(False)
-        sidebar.configure(width=self.px(258))
+        sidebar_outer.configure(width=self.px(250))
+        sidebar_outer.pack_propagate(False)
+        sidebar.configure(width=self.px(230))
         self._build_sidebar(sidebar)
 
         self.content = tk.Frame(body, bg=COLORS["bg"])
@@ -493,7 +541,9 @@ class ProjectApp(tk.Tk):
         self.search_var = tk.StringVar(value="")
         search = ttk.Entry(parent, textvariable=self.search_var)
         search.pack(fill="x", pady=(self.px(9), self.px(6)))
-        self.search_var.trace_add("write", lambda *_: self._refresh_projects())
+        self.search_var.trace_add("write", self._schedule_search)
+        search.bind("<Escape>", lambda _event: self.search_var.set(""))
+        self._set_tooltip(search, "搜索项目、报销人或部门；按 Esc 清空")
 
         self.status_filter_var = tk.StringVar(value="全部")
         filter_box = ttk.Combobox(
@@ -537,7 +587,15 @@ class ProjectApp(tk.Tk):
         save_settings(self.settings)
         self.destroy()
 
+    def _schedule_search(self, *_args) -> None:
+        if self._search_job is not None:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(180, self._refresh_projects)
+
     def _refresh_projects(self) -> None:
+        if self._search_job is not None:
+            self.after_cancel(self._search_job)
+            self._search_job = None
         if self.project_scroll is None:
             return
         self.project_scroll.clear()
@@ -587,7 +645,8 @@ class ProjectApp(tk.Tk):
             anchor="w",
             justify="left",
         )
-        name.pack(side="left", fill="x", expand=True)
+        name.pack(fill="x")
+        name.bind("<Configure>", lambda event: name.configure(wraplength=max(100, event.width)))
         status = tk.Label(
             top,
             text=project.status_label,
@@ -597,17 +656,19 @@ class ProjectApp(tk.Tk):
             padx=self.px(6),
             pady=self.px(1),
         )
-        status.pack(side="right")
+        status.pack(anchor="w", pady=(self.px(4), 0))
 
         meta = tk.Label(
             body,
-            text=f"{project.date_range_text}  ·  ¥{project.total():,.2f}",
+            text=f"{project.date_range_text}\n合计 ¥{project.total():,.2f}",
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=bg,
             anchor="w",
         )
         meta.pack(fill="x", pady=(self.px(3), 0))
+        meta.configure(justify="left")
+        meta.bind("<Configure>", lambda event: meta.configure(wraplength=max(100, event.width)))
         missing = project.missing_count()
         foot = tk.Frame(body, bg=bg)
         foot.pack(fill="x", pady=(self.px(4), 0))
@@ -667,6 +728,44 @@ class ProjectApp(tk.Tk):
         self._render_project()
         self._refresh_projects()
 
+    def _show_usage(self) -> None:
+        UsageDialog(self)
+
+    def _check_update_ui(self) -> None:
+        if self._update_check_running:
+            return
+        if updater.install_root() is None:
+            messagebox.showinfo(
+                "软件更新",
+                "当前是便携版（单文件 exe），不支持站内自动更新。\n"
+                "请到 gitee / github 下载新版覆盖即可。",
+                parent=self,
+            )
+            return
+
+        self._update_check_running = True
+        self.update_button.configure(text="检查中…", state="disabled")
+
+        def work() -> None:
+            try:
+                manifest = updater.check_update()
+                self.ui_queue.put(("update_checked", manifest, ""))
+            except Exception as exc:
+                self.ui_queue.put(("update_checked", None, str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_checked(self, manifest, error: str = "") -> None:
+        self._update_check_running = False
+        self.update_button.configure(text="🔄 软件更新", state="normal")
+        if error:
+            messagebox.showwarning("暂时无法检查更新", f"{error}\n\n请稍后重试；报销资料可继续离线使用。", parent=self)
+            return
+        if manifest is None:
+            messagebox.showinfo("软件更新", "当前已是最新版本。", parent=self)
+            return
+        UpdateDialog(self, manifest)
+
     def choose_workspace(self) -> None:
         folder = filedialog.askdirectory(title="选择报销台账目录", initialdir=str(self.workspace_root))
         if not folder:
@@ -715,10 +814,13 @@ class ProjectApp(tk.Tk):
             return
         for child in self.content.winfo_children():
             child.destroy()
+        self._editor_cache.clear()
+        self._record_cards.clear()
+        self.ocr_labels.clear()
         project = self.project
         project.sort_records()
 
-        header_outer, header = self._card(self.content, pad=self.px(12))
+        header_outer, header = self._card(self.content, pad=12)
         header_outer.pack(fill="x", pady=(0, self.px(8)))
         top = tk.Frame(header, bg=COLORS["panel"])
         top.pack(fill="x")
@@ -732,16 +834,20 @@ class ProjectApp(tk.Tk):
             meta += f"  ·  {project.department}"
         tk.Label(left, text=meta, font=("Microsoft YaHei UI", 8), fg=COLORS["muted"], bg=COLORS["panel"]).pack(anchor="w", pady=(2, 0))
 
-        actions = tk.Frame(top, bg=COLORS["panel"])
-        actions.pack(side="right")
-        ttk.Checkbutton(actions, text="OCR 辅助", variable=self.ocr_enabled, command=self._save_ocr_setting).pack(side="left", padx=(0, 8))
+        actions = tk.Frame(header, bg=COLORS["panel"])
+        actions.pack(fill="x", pady=(self.px(12), 0))
+        ttk.Checkbutton(actions, text="OCR 辅助", variable=self.ocr_enabled, command=self._save_ocr_setting).pack(side="left", padx=(0, 10))
+        tk.Label(actions, text="🏷 状态", font=("Microsoft YaHei UI", 9, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(side="left", padx=(0, 4))
         self.status_var = tk.StringVar(value=project.status_label)
-        status_combo = ttk.Combobox(actions, textvariable=self.status_var, values=self._status_labels, state="readonly", width=10)
-        status_combo.pack(side="left", padx=(0, 8))
+        status_combo = ttk.Combobox(actions, textvariable=self.status_var, values=self._status_labels, state="readonly", width=12, style="Status.TCombobox")
+        status_combo.pack(side="left", padx=(0, 10))
         status_combo.bind("<<ComboboxSelected>>", lambda _event: self.change_status())
         ttk.Button(actions, text="⚙ 项目设置", style="Soft.TButton", command=self.edit_project).pack(side="left", padx=(0, 6))
         ttk.Button(actions, text="🗑 删除", style="Danger.TButton", command=self.delete_project).pack(side="left", padx=(0, 6))
-        ttk.Button(actions, text="📄 生成 Word", style="Accent.TButton", command=self.generate_word).pack(side="left")
+        self.generate_button = ttk.Button(actions, text="📄 生成 Word", style="Accent.TButton", command=self.generate_word)
+        self.generate_button.pack(side="right")
+        if self._generating:
+            self.generate_button.configure(text="生成中…", state="disabled")
 
         stats = tk.Frame(self.content, bg=COLORS["bg"])
         stats.pack(fill="x", pady=(0, self.px(8)))
@@ -750,9 +856,13 @@ class ProjectApp(tk.Tk):
         body = ttk.PanedWindow(self.content, orient=tk.HORIZONTAL)
         body.pack(fill="both", expand=True)
         records_outer, records = self._card(body, pad=0)
-        body.add(records_outer, weight=2)
+        body.add(records_outer, weight=1)
         editor_outer, editor = self._card(body, pad=0)
         body.add(editor_outer, weight=3)
+        def position_sash():
+            if body.winfo_exists():
+                body.sashpos(0, min(self.px(275), max(self.px(210), body.winfo_width() // 3)))
+        self.after_idle(position_sash)
 
         rec_head = tk.Frame(records, bg=COLORS["panel"], padx=self.px(10), pady=self.px(8))
         rec_head.pack(fill="x")
@@ -838,6 +948,7 @@ class ProjectApp(tk.Tk):
         if self.record_scroll is None or self.project is None:
             return
         self.record_scroll.clear()
+        self._record_cards = {}
         project = self.project
         if not project.records:
             tk.Label(
@@ -861,6 +972,7 @@ class ProjectApp(tk.Tk):
                 cursor="hand2",
             )
             card.pack(fill="x", pady=(0, self.px(6)), padx=self.px(1))
+            self._record_cards[record.id] = card
             body = tk.Frame(card, bg=bg, padx=self.px(9), pady=self.px(7))
             body.pack(fill="both", expand=True)
             top = tk.Frame(body, bg=bg)
@@ -905,9 +1017,25 @@ class ProjectApp(tk.Tk):
                 child.bind("<Button-1>", lambda _event, rid=record.id: self.select_record(rid))
 
     def select_record(self, record_id: str) -> None:
+        if self.current_record_id == record_id:
+            return
+        previous = self.current_record_id
+        # Move focus out of the old form before it becomes a hidden cached view.
+        self.focus_set()
         self.current_record_id = record_id
-        self._render_records()
-        self._render_editor()
+        for rid in (previous, record_id):
+            card = self._record_cards.get(rid)
+            if card is None:
+                continue
+            selected = rid == record_id
+            bg = "#F0FAFB" if selected else COLORS["panel"]
+            card.configure(highlightbackground=COLORS["accent"] if selected else COLORS["line"])
+            pending = [card]
+            while pending:
+                widget = pending.pop()
+                widget.configure(bg=bg)
+                pending.extend(widget.winfo_children())
+        self._render_editor(reuse=True)
         self.settings["last_project_record"] = record_id
 
     def _record(self) -> Record | None:
@@ -915,43 +1043,50 @@ class ProjectApp(tk.Tk):
             return None
         return self.project.find_record(self.current_record_id)
 
-    def _render_editor(self) -> None:
+    def _render_editor(self, reuse: bool = False) -> None:
         if self.editor_scroll is None or self.project is None:
             return
-        self.editor_scroll.clear()
-        self._asset_vars = {}
         record = self._record()
         if record is None:
-            tk.Label(
-                self.editor_scroll.body,
-                text="选择左侧一条费用记录，\n在这里添加发票、支付记录和其他材料。",
-                font=("Microsoft YaHei UI", 9),
-                fg=COLORS["muted"],
-                bg=COLORS["panel"],
-                justify="center",
-            ).pack(pady=self.px(50))
+            self.editor_scroll.clear()
+            self._editor_cache.clear()
             return
-
-        top = tk.Frame(self.editor_scroll.body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(8))
+        for child in self.editor_scroll.body.winfo_children():
+            child.pack_forget()
+        cached = self._editor_cache.get(record.id)
+        signature = record.to_dict()
+        if reuse and cached is not None and cached[1] == signature:
+            self._editor_body, _, self.field_vars, self._asset_vars, self._asset_meta_labels = cached
+            self._editor_body.pack(fill="both", expand=True)
+            self._editor_cache.move_to_end(record.id)
+            self.editor_scroll.scroll_to_top()
+            return
+        if cached is not None:
+            cached[0].destroy()
+        self._editor_body = tk.Frame(self.editor_scroll.body, bg=COLORS["panel"])
+        self._editor_body.pack(fill="both", expand=True)
+        self._asset_vars = {}
+        self._asset_meta_labels = {}
+        top = tk.Frame(self._editor_body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(8))
         top.pack(fill="x")
         tk.Label(top, text=f"{record.icon} {record.label}", font=("Microsoft YaHei UI", 12, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(side="left")
         tk.Label(top, text=record.date, font=("Consolas", 8), fg=COLORS["muted"], bg=COLORS["panel"]).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="删除记录", style="Danger.TButton", command=self.delete_record).pack(side="right")
 
         # 先放素材槽位，识别信息/时间放到最下面。
-        slots_title = tk.Frame(self.editor_scroll.body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(6))
+        slots_title = tk.Frame(self._editor_body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(6))
         slots_title.pack(fill="x")
         tk.Label(slots_title, text="材料槽位", font=("Microsoft YaHei UI", 9, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(side="left")
         tk.Label(slots_title, text="文件 / 粘贴 / 截图", font=("Microsoft YaHei UI", 8), fg=COLORS["muted"], bg=COLORS["panel"]).pack(side="right")
         for key in record.template()["slots"]:
             self._build_slot(record, key)
 
-        info_head = tk.Frame(self.editor_scroll.body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(8))
+        info_head = tk.Frame(self._editor_body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(8))
         info_head.pack(fill="x", pady=(self.px(8), 0))
         tk.Label(info_head, text="识别信息 / 时间", font=("Microsoft YaHei UI", 9, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(side="left")
         tk.Label(info_head, text="时间自动识别，识别不到再改", font=("Microsoft YaHei UI", 8), fg=COLORS["muted"], bg=COLORS["panel"]).pack(side="right")
 
-        form = tk.Frame(self.editor_scroll.body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(4))
+        form = tk.Frame(self._editor_body, bg=COLORS["panel"], padx=self.px(12), pady=self.px(4))
         form.pack(fill="x")
         self.field_vars = {
             "date": tk.StringVar(value=record.date),
@@ -975,14 +1110,20 @@ class ProjectApp(tk.Tk):
             )
             entry = ttk.Entry(form, textvariable=self.field_vars[key])
             entry.grid(row=row * 2 + 1, column=col, columnspan=span, sticky="ew", padx=(0, 10), pady=(2, 4))
-            entry.bind("<FocusOut>", lambda _event, r=record: self.save_fields(r))
-            entry.bind("<Return>", lambda _event, r=record: self.save_fields(r))
+            entry.bind("<FocusOut>", lambda _event, r=record, v=self.field_vars: self.save_fields(r, v))
+            entry.bind("<Return>", lambda _event, r=record, v=self.field_vars: self.save_fields(r, v))
             if key == "date":
                 entry.bind("<KeyRelease>", lambda _event, r=record: setattr(r, "date_manual", True))
             if key == "payment_amount":
                 entry.bind("<KeyRelease>", lambda _event, r=record: setattr(r, "payment_manual", True))
         form.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
+        self._editor_cache[record.id] = (self._editor_body, record.to_dict(), self.field_vars, self._asset_vars, self._asset_meta_labels)
+        self._editor_cache.move_to_end(record.id)
+        while len(self._editor_cache) > 6:
+            rid, old = self._editor_cache.popitem(last=False)
+            old[0].destroy()
+            self.ocr_labels = {key: label for key, label in self.ocr_labels.items() if key[0] != rid}
 
     def _is_required(self, record: Record, key: str) -> bool:
         required = list(record.template().get("required", []))
@@ -994,7 +1135,7 @@ class ProjectApp(tk.Tk):
         assets = record.slot_assets(key)
         required = self._is_required(record, key)
         card = tk.Frame(
-            self.editor_scroll.body,
+            self._editor_body,
             bg="#F8FCFE",
             highlightbackground=COLORS["line"],
             highlightthickness=1,
@@ -1018,11 +1159,11 @@ class ProjectApp(tk.Tk):
 
         actions = tk.Frame(card, bg="#F8FCFE", padx=self.px(8), pady=self.px(2))
         actions.pack(fill="x")
-        ttk.Button(actions, text="选择文件", style="Soft.TButton", command=lambda: self.add_asset(record, key, "file")).pack(side="left", padx=(0, 4))
-        ttk.Button(actions, text="粘贴", style="Soft.TButton", command=lambda: self.add_asset(record, key, "paste")).pack(side="left", padx=(0, 4))
-        ttk.Button(actions, text="截图", style="Soft.TButton", command=lambda: self.add_asset(record, key, "capture")).pack(side="left", padx=(0, 4))
+        ttk.Button(actions, text="选择文件", style="Compact.TButton", command=lambda: self.add_asset(record, key, "file")).pack(side="left", padx=(0, 4))
+        ttk.Button(actions, text="粘贴", style="Compact.TButton", command=lambda: self.add_asset(record, key, "paste")).pack(side="left", padx=(0, 4))
+        ttk.Button(actions, text="截图", style="Compact.TButton", command=lambda: self.add_asset(record, key, "capture")).pack(side="left", padx=(0, 4))
         if key in {"invoice", "payment", "itinerary"}:
-            ttk.Button(actions, text="识别", style="Soft.TButton", command=lambda: self._reocr_slot(record, key)).pack(side="left", padx=(0, 4))
+            ttk.Button(actions, text="识别", style="Compact.TButton", command=lambda: self._reocr_slot(record, key)).pack(side="left", padx=(0, 4))
 
         if not assets:
             tk.Label(
@@ -1048,28 +1189,46 @@ class ProjectApp(tk.Tk):
             info = tk.Frame(row, bg="#F8FCFE")
             info.grid(row=0, column=1, sticky="ew")
             tk.Label(info, text=asset.display_name, font=("Microsoft YaHei UI", 8), fg=COLORS["ink"], bg="#F8FCFE", anchor="w", wraplength=self.px(210)).pack(anchor="w")
-            meta = f"{asset.source} · {asset.added_at[:16]}"
-            if asset.amount:
-                if asset.refund_amount:
-                    net = round(asset.amount - asset.refund_amount, 2)
-                    meta = f"支付 ¥{asset.amount:,.2f} · 退款 ¥{asset.refund_amount:,.2f} · 净 ¥{net:,.2f} · " + meta
-                else:
-                    meta = f"识别到 ¥{asset.amount:,.2f} · " + meta
-            # wraplength 让过长的 meta 自动换行，避免被右侧“查看/删除”列截断遮挡
-            tk.Label(info, text=meta, font=("Microsoft YaHei UI", 7), fg=COLORS["muted"], bg="#F8FCFE", anchor="w", wraplength=self.px(210)).pack(anchor="w")
+            meta_label = tk.Label(info, text=self._asset_meta_text(asset), font=("Microsoft YaHei UI", 7), fg=COLORS["muted"], bg="#F8FCFE", anchor="w", justify="left", wraplength=self.px(210))
+            meta_label.pack(anchor="w")
+            self._asset_meta_labels[asset.id] = meta_label
+            def wrap_info(event, container=info):
+                width = max(self.px(80), event.width)
+                for label in container.winfo_children():
+                    if int(label.cget("wraplength")) != width:
+                        label.configure(wraplength=width)
+            info.bind("<Configure>", wrap_info)
             actions = tk.Frame(row, bg="#F8FCFE")
             actions.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(self.px(8), 0))
-            ttk.Button(actions, text="查看", style="Soft.TButton", command=lambda a=asset: self.open_asset(a)).grid(row=0, column=0, padx=(0, 4), pady=(0, self.px(4)))
-            ttk.Button(actions, text="删除", style="Danger.TButton", command=lambda a=asset, k=key: self.delete_asset(record, k, a)).grid(row=0, column=1, pady=(0, self.px(4)))
+            # 查看 / 删除 保持默认内容宽度（与发票等槽位一致）；金额框在下方自行适配“查看”宽度
+            ttk.Button(actions, text="查看", style="Soft.TButton", command=lambda a=asset: self.open_asset(a)).grid(row=0, column=0, padx=(0, 3), pady=(0, self.px(3)))
+            ttk.Button(actions, text="删除", style="Danger.TButton", command=lambda a=asset, k=key: self.delete_asset(record, k, a)).grid(row=0, column=1, padx=(3, 0), pady=(0, self.px(3)))
             if key == "payment":
                 self._build_payment_amount_editor(record, asset, actions)
+            def fit_asset(event, buttons=actions):
+                if event.width < self.px(460):
+                    buttons.grid_configure(row=1, column=1, rowspan=1, sticky="e", pady=(self.px(6), 0))
+                else:
+                    buttons.grid_configure(row=0, column=2, rowspan=2, sticky="ne", pady=0)
+            row.bind("<Configure>", fit_asset)
+
+    @staticmethod
+    def _asset_meta_text(asset: Asset) -> str:
+        meta = f"{asset.source} · {asset.added_at[:16]}"
+        if asset.amount is not None:
+            if asset.refund_amount:
+                net = round(asset.amount - asset.refund_amount, 2)
+                return f"支付 ¥{asset.amount:,.2f} · 退款 ¥{asset.refund_amount:,.2f} · 净 ¥{net:,.2f} · " + meta
+            return f"金额 ¥{asset.amount:,.2f} · " + meta
+        return meta
 
     def _build_payment_amount_editor(self, record: Record, asset: Asset, actions: tk.Frame) -> None:
         # 金额输入框放在「查看」正下方、计算按钮放在「删除」正下方，二者并列，
         # 与上方 查看/删除 共用 actions 的两列网格，排版保持一致；不再显示“已手改”。
         var = tk.StringVar(value=f"{asset.amount:.2f}" if asset.amount is not None else "")
-        entry = ttk.Entry(actions, textvariable=var, width=6)
-        entry.grid(row=1, column=0, sticky="w", padx=(0, 4))
+        entry = ttk.Entry(actions, textvariable=var, style="PayAmount.TEntry", width=10)
+        # 与「查看 / 删除 / 计算」共用同一套等宽网格，四格等高齐宽
+        entry.grid(row=1, column=0, sticky="ew", padx=(0, 3))
         self._set_tooltip(entry, "支付金额：可手动修改，或点右侧「计算」")
         self._asset_vars[asset.id] = var
 
@@ -1084,12 +1243,20 @@ class ProjectApp(tk.Tk):
             text="🧮 计算",
             style="Soft.TButton",
             command=lambda r=record, a=asset, v=var: self._open_calculator(r, a, v),
-        ).grid(row=1, column=1, sticky="e")
+        ).grid(row=1, column=1, padx=(3, 0))
 
     def _save_asset_amount(self, record: Record, asset: Asset, value: str) -> None:
-        if not self.project or self.project.find_record(record.id) is None:
+        if not self.project or self.project.find_record(record.id) is not record:
             return
         new_amount = self._parse_amount(value)
+        if value.strip() and new_amount is None:
+            messagebox.showwarning("金额格式", "请输入不小于 0 的有效金额，例如 128.50。", parent=self)
+            var = self._asset_vars.get(asset.id)
+            if var is not None:
+                var.set(f"{asset.amount:.2f}" if asset.amount is not None else "")
+            return
+        if new_amount == asset.amount:
+            return
         asset.amount = new_amount
         asset.amount_manual = new_amount is not None
         # 手动改过某笔支付后，记录总支付金额按各笔净额重新自动合计。
@@ -1098,7 +1265,13 @@ class ProjectApp(tk.Tk):
         record.updated_at = datetime.now().isoformat(timespec="seconds")
         self.project.save()
         if self._record() is record:
-            self._render_editor()
+            # Keep the entry and neighboring buttons alive during FocusOut.
+            var = self.field_vars.get("payment_amount")
+            if var is not None:
+                var.set(f"{record.payment_amount:.2f}" if record.payment_amount is not None else "")
+            label = self._asset_meta_labels.get(asset.id)
+            if label is not None:
+                label.configure(text=self._asset_meta_text(asset))
             self._render_records()
         self._refresh_stats_only()
 
@@ -1112,10 +1285,18 @@ class ProjectApp(tk.Tk):
 
         CalculatorWindow(self, initial, on_apply)
 
-    def save_fields(self, record: Record) -> None:
-        if not self.project or self.project.find_record(record.id) is None:
+    def save_fields(self, record: Record, values=None) -> None:
+        if not self.project or self.project.find_record(record.id) is not record:
             return
-        new_date = self.field_vars["date"].get().strip()
+        values = self.field_vars if values is None else values
+        parsed = {}
+        for key in ("amount", "payment_amount"):
+            raw = values[key].get()
+            parsed[key] = self._parse_amount(raw)
+            if raw.strip() and parsed[key] is None:
+                messagebox.showwarning("金额格式", "请输入不小于 0 的有效金额，例如 128.50。", parent=self)
+                return
+        new_date = values["date"].get().strip()
         if new_date:
             try:
                 date.fromisoformat(new_date)
@@ -1124,18 +1305,21 @@ class ProjectApp(tk.Tk):
                 return
         else:
             new_date = record.date
+        before = record.to_dict()
         if new_date != record.date:
             record.date_manual = True
             record.date_ocr = False
         record.date = new_date
-        record.amount = self._parse_amount(self.field_vars["amount"].get())
-        new_payment = self._parse_amount(self.field_vars["payment_amount"].get())
+        record.amount = parsed["amount"]
+        new_payment = parsed["payment_amount"]
         if new_payment != record.payment_amount:
             record.payment_manual = True
         record.payment_amount = new_payment
-        record.invoice_no = self.field_vars["invoice_no"].get().strip()
-        record.seller = self.field_vars["seller"].get().strip()
-        record.note = self.field_vars["note"].get().strip()
+        record.invoice_no = values["invoice_no"].get().strip()
+        record.seller = values["seller"].get().strip()
+        record.note = values["note"].get().strip()
+        if record.to_dict() == before:
+            return
         record.updated_at = datetime.now().isoformat(timespec="seconds")
         self.project.save()
         self._refresh_stats_only()
@@ -1147,7 +1331,8 @@ class ProjectApp(tk.Tk):
         if not value:
             return None
         try:
-            return round(float(value), 2)
+            amount = float(value)
+            return round(amount, 2) if math.isfinite(amount) and amount >= 0 else None
         except ValueError:
             return None
 
@@ -1199,6 +1384,7 @@ class ProjectApp(tk.Tk):
         size = size or (self.px(100), self.px(72))
         key = f"{path}:{size}:{path.stat().st_mtime_ns}"
         if key in self._thumb_refs:
+            self._thumb_refs.move_to_end(key)
             return self._thumb_refs[key]
         try:
             image = None
@@ -1206,20 +1392,24 @@ class ProjectApp(tk.Tk):
                 try:
                     import pypdfium2 as pdfium
 
-                    pdf = pdfium.PdfDocument(str(path))
-                    try:
-                        bitmap = pdf[0].render(scale=1.2)
-                        image = bitmap.to_pil()
-                    finally:
-                        pdf.close()
+                    with pdfium.PdfDocument(str(path)) as pdf:
+                        with pdf[0] as page:
+                            scale = min(size[0] / page.get_width(), size[1] / page.get_height())
+                            with page.render(scale=max(scale, 0.01)) as bitmap:
+                                image = bitmap.to_pil().copy()
                 except Exception:
                     image = None
             if image is None:
-                image = Image.open(path)
-            image = image.convert("RGB")
-            image.thumbnail(size, Image.LANCZOS)
-            photo = ImageTk.PhotoImage(image)
+                with Image.open(path) as source:
+                    source.draft("RGB", size)
+                    source.thumbnail(size, Image.Resampling.LANCZOS)
+                    image = source.convert("RGB")
+            else:
+                image.thumbnail(size, Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(image, master=self)
             self._thumb_refs[key] = photo
+            while len(self._thumb_refs) > 64:
+                self._thumb_refs.popitem(last=False)
             return photo
         except Exception:
             return None
@@ -1361,7 +1551,7 @@ class ProjectApp(tk.Tk):
     def _start_ocr(self, record: Record, slot: str, asset: Asset) -> None:
         if not self.project or not self.ocr_enabled.get() or slot not in {"invoice", "payment", "itinerary"}:
             return
-        key = (record.id, slot, asset.id)
+        key = (self.project.id, record.id, slot, asset.id)
         if key in self._ocr_jobs:
             return
         self._ocr_jobs.add(key)
@@ -1372,6 +1562,10 @@ class ProjectApp(tk.Tk):
         path = asset.path(self.project.folder)
 
         def worker() -> None:
+            from .extract import Extractor
+            from .classify import classify
+            from .parser import parse_material
+
             data = {}
             error = ""
             extractor = Extractor(use_ocr=True)
@@ -1396,8 +1590,10 @@ class ProjectApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_ocr(self, project_id: str, record_id: str, slot: str, asset_id: str, data: dict, error: str) -> None:
-        self._ocr_jobs = {job for job in self._ocr_jobs if job[1] != record_id or job[0] != project_id}
-        project = self.workspace.find(project_id) or self.project
+        self._ocr_jobs.discard((project_id, record_id, slot, asset_id))
+        project = self.workspace.find(project_id)
+        if project is None and self.project and self.project.id == project_id:
+            project = self.project
         if not project:
             return
         record = project.find_record(record_id)
@@ -1448,7 +1644,9 @@ class ProjectApp(tk.Tk):
                 self._refresh_projects()
 
     def generate_word(self) -> None:
-        if not self.project:
+        from .project_docgen import project_filename
+
+        if not self.project or self._generating:
             return
         if not self.project.records:
             messagebox.showinfo("生成 Word", "还没有费用记录，先添加一条吧。", parent=self)
@@ -1475,11 +1673,39 @@ class ProjectApp(tk.Tk):
         )
         if not path:
             return
-        try:
-            generated = build_project_document(self.project, Path(path))
-        except Exception as exc:
-            messagebox.showerror("生成失败", str(exc), parent=self)
+        # Render a snapshot in the background; only the UI thread saves live metadata.
+        from copy import deepcopy
+        snapshot = deepcopy(self.project)
+        project = self.project
+        self._generating = True
+        self.generate_button.configure(text="生成中…", state="disabled")
+        def worker():
+            try:
+                from .project_docgen import build_project_document
+                generated = build_project_document(snapshot, Path(path), save_metadata=False)
+                self.ui_queue.put(("word_done", project, generated, ""))
+            except Exception as exc:
+                self.ui_queue.put(("word_done", project, None, str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_word_generated(self, project, generated, error: str) -> None:
+        self._generating = False
+        if self.generate_button.winfo_exists():
+            self.generate_button.configure(text="📄 生成 Word", state="normal")
+        if error:
+            messagebox.showerror("生成失败", error, parent=self)
             return
+        try:
+            try:
+                output = generated.relative_to(project.folder).as_posix()
+            except ValueError:
+                output = str(generated)
+            if output not in project.outputs:
+                project.outputs.append(output)
+            if self.workspace.find(project.id) is not None:
+                project.save()
+        except OSError as exc:
+            messagebox.showwarning("Word 已生成", f"文件已保存，但台账记录保存失败：{exc}", parent=self)
         self._refresh_projects()
         if messagebox.askyesno("生成完成", f"已生成：\n{generated}\n\n是否打开文档？", parent=self):
             try:
@@ -1526,7 +1752,10 @@ def _safe_eval(expr: str) -> float:
             raise ValueError("unsupported binary op")
         raise ValueError("unsupported expression")
 
-    return _eval(node)
+    result = _eval(node)
+    if not math.isfinite(result):
+        raise ValueError("result is not finite")
+    return result
 
 
 # 键盘按键 -> 计算器表达式 token。半角 "-" 及各种 Unicode/全角减号统一映射为
@@ -1730,6 +1959,7 @@ class CalculatorWindow(tk.Toplevel):
     def _evaluate(self) -> None:
         raw = self.expr.replace("×", "*").replace("−", "-").replace("÷", "/")
         if not raw:
+            self.value = None
             return
         try:
             result = _safe_eval(raw)
@@ -1750,10 +1980,13 @@ class CalculatorWindow(tk.Toplevel):
         self._display.configure(text=self.expr or "0", fg=COLORS["accent"])
 
     def _apply(self) -> None:
-        if self.value is None:
-            self._evaluate()
+        # Always evaluate the visible expression, even after an earlier '='.
+        self._evaluate()
         if self.value is None:
             self._display.configure(text="计算错误", fg=COLORS["error"])
+            return
+        if self.value < 0:
+            self._display.configure(text="金额不能小于 0", fg=COLORS["error"])
             return
         try:
             self.on_apply(self.value)
@@ -1761,5 +1994,196 @@ class CalculatorWindow(tk.Toplevel):
             messagebox.showerror("写入失败", str(exc), parent=self)
             return
         self.destroy()
+
+
+class UpdateDialog(tk.Toplevel):
+    """软件更新对话框：显示更新说明与下载进度，确认后下载并替换重启。"""
+
+    def __init__(self, parent: tk.Widget, manifest: dict) -> None:
+        super().__init__(parent)
+        self.manifest = manifest
+        self.events = queue.Queue()
+        self._busy = False
+        self.title("软件更新")
+        self.configure(bg=COLORS["bg"])
+        self.resizable(False, False)
+        self.transient(parent)
+        scale = float(getattr(parent, "ui_scale", 1.0) or 1.0)
+        wrap = int(420 * scale)
+
+        card = tk.Frame(self, bg=COLORS["panel"], highlightbackground=COLORS["line"], highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=int(14 * scale), pady=int(14 * scale))
+        inner = tk.Frame(card, bg=COLORS["panel"], padx=int(20 * scale), pady=int(18 * scale))
+        inner.pack(fill="both", expand=True)
+
+        tk.Label(inner, text="发现新版本", font=("Microsoft YaHei UI", 13, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(anchor="w")
+        tk.Label(
+            inner,
+            text=f"当前 {__version__}   →   最新 {manifest.get('version', '')}",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["panel"],
+        ).pack(anchor="w", pady=(4, 8))
+        notes = (manifest.get("notes") or "").strip() or "（作者未填写更新说明）"
+        tk.Label(
+            inner, text=notes, justify="left", anchor="nw", wraplength=wrap,
+            font=("Microsoft YaHei UI", 9), fg=COLORS["ink"], bg=COLORS["panel"],
+        ).pack(anchor="w", fill="x")
+
+        self.progress = ttk.Progressbar(inner, mode="determinate", maximum=100, length=int(360 * scale))
+        self.pct = tk.Label(inner, text="", font=("Microsoft YaHei UI", 8), fg=COLORS["muted"], bg=COLORS["panel"])
+
+        btns = tk.Frame(inner, bg=COLORS["panel"])
+        btns.pack(fill="x", pady=(16, 0))
+        self.update_btn = ttk.Button(btns, text="立即更新", style="Accent.TButton", command=self._start)
+        self.update_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(btns, text="取消", style="Soft.TButton", command=self._close)
+        self.cancel_btn.pack(side="left", padx=(8, 0))
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._center(parent)
+        self.grab_set()
+        self.after(100, self._poll_events)
+
+    def _close(self) -> None:
+        if not self._busy:
+            self.destroy()
+
+    def _poll_events(self) -> None:
+        latest_progress = None
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "error":
+                    self._failed(payload)
+                    latest_progress = None
+                else:
+                    latest_progress = payload
+        except queue.Empty:
+            pass
+        if latest_progress is not None:
+            self._set_progress(*latest_progress)
+        self.after(100, self._poll_events)
+
+    def _center(self, parent: tk.Widget) -> None:
+        self.update_idletasks()
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = max(parent.winfo_width(), 640)
+        ph = max(parent.winfo_height(), 480)
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 2)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, min(x, max(0, sw - w - 20)))
+        y = max(0, min(y, max(0, sh - h - 60)))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _resize(self) -> None:
+        self.update_idletasks()
+        h = self.winfo_reqheight()
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.geometry())
+        if m:
+            self.geometry(f"{m.group(1)}x{h}+{m.group(3)}+{m.group(4)}")
+
+    def _start(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.update_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="disabled")
+        self.progress.pack(fill="x", pady=(12, 2))
+        self.pct.pack(anchor="w")
+        self._resize()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _set_progress(self, done: int, total: int) -> None:
+        pct = int(done * 100 / total) if total else 0
+        self.progress["value"] = pct
+        self.pct.configure(text=f"下载中 {pct}%（{done // 1024} / {total // 1024} KB）")
+        self._resize()
+
+    def _worker(self) -> None:
+        try:
+            updater.apply_update(
+                self.manifest,
+                on_progress=lambda d, t: self.events.put(("progress", (d, t))),
+            )
+        except Exception as exc:  # 下载/校验失败：提示且不退出、不改动文件
+            self.events.put(("error", str(exc)))
+
+    def _failed(self, msg: str) -> None:
+        self._busy = False
+        self.update_btn.configure(state="normal")
+        self.cancel_btn.configure(state="normal")
+        self.progress.pack_forget()
+        self.pct.pack_forget()
+        messagebox.showerror("更新失败", msg, parent=self)
+
+
+class UsageDialog(tk.Toplevel):
+    """使用说明弹窗，重点说明「截图」与「计算」两个功能的用法。"""
+
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(parent)
+        self.title("使用说明")
+        self.configure(bg=COLORS["bg"])
+        self.resizable(False, False)
+        self.transient(parent)
+        # 让正文按缩放后的实际内容宽度换行并撑满卡片，不在右侧留白
+        scale = float(getattr(parent, "ui_scale", 1.0) or 1.0)
+        wrap = int(460 * scale)
+
+        card = tk.Frame(self, bg=COLORS["panel"], highlightbackground=COLORS["line"], highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+        inner = tk.Frame(card, bg=COLORS["panel"], padx=20, pady=18)
+        inner.pack(fill="both", expand=True)
+
+        def section(title: str, body_text: str) -> None:
+            tk.Label(
+                inner, text=title,
+                font=("Microsoft YaHei UI", 10, "bold"), fg=COLORS["accent"], bg=COLORS["panel"],
+            ).pack(anchor="w", pady=(10, 3))
+            tk.Label(
+                inner, text=body_text,
+                font=("Microsoft YaHei UI", 9), fg=COLORS["ink"], bg=COLORS["panel"],
+                justify="left", anchor="nw", wraplength=wrap,
+            ).pack(anchor="w", fill="x")
+
+        section(
+            "基本流程",
+            "新建报销项目 → 添加费用记录 → 在各槽位添加素材（选择文件 / 粘贴 / 截图）→ "
+            "开启 OCR 后自动预填金额、日期、发票号（识别不准可随手改）→ 需要时生成 Word。项目会自动保存。",
+        )
+        section(
+            "截图",
+            "点槽位里的「截图」会调起 Windows 系统截图，覆盖所有显示器；拖选区域后自动把图片粘进该槽位；按 ESC 取消则软件立即恢复、不会添加素材。",
+        )
+        section(
+            "计算",
+            "每条支付记录上可以直接改金额；点「🧮 计算」打开小计算器（支持 + − × ÷，可用键盘输入），算完点「填入金额」即写回该笔支付；改动后总支付金额会自动重新合计。",
+        )
+        ttk.Button(inner, text="知道了", style="Accent.TButton", command=self.destroy).pack(pady=(18, 0))
+        # 自适应：按内容实际尺寸定窗口并居中，避免右侧/下方留白（不写死固定尺寸）
+        self.update_idletasks()
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
+        parent.update_idletasks()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = max(parent.winfo_width(), 640)
+        ph = max(parent.winfo_height(), 480)
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 2)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, min(x, max(0, sw - w - 20)))
+        y = max(0, min(y, max(0, sh - h - 60)))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.grab_set()
+        self.wait_window(self)
 
 
