@@ -1,7 +1,7 @@
 ; Inno Setup 安装脚本 —— 把 onedir 打成安装包（安装版，支持自动更新）
 ; 用法：安装 Inno Setup 后，在项目根目录执行：
-;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.2.0 "tools\installer.iss"
-; 产物：dist\报销材料整理助手-setup-v<version>.exe
+;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=2.3.0 "tools\installer.iss"
+; 产物：dist\reimburse-setup-v<version>.exe
 #define AppName "报销材料整理助手"
 #ifndef AppVersion
   #define AppVersion "2.3.0"
@@ -25,6 +25,10 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 DefaultDirName={localappdata}\Programs\{#AppName}
+; Always offer a directory choice, including when this application is installed.
+DisableDirPage=no
+UsePreviousAppDir=yes
+AlwaysShowDirOnReadyPage=yes
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
