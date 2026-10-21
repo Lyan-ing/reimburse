@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -28,6 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from reimburse import __version__  # noqa: E402
+from reimburse.update_protocol import APP_ID, INSTALL_MANIFEST, validate_files
 
 APP = "报销材料整理助手"
 DEFAULT_PY = r"C:\Users\LENOVO\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
@@ -44,7 +46,7 @@ def sha256_file(p: Path) -> str:
 def scan_manifest(onedir: Path) -> dict:
     files: dict[str, dict] = {}
     for p in sorted(onedir.rglob("*")):
-        if p.is_file():
+        if p.is_file() and p.name != INSTALL_MANIFEST:
             rel = p.relative_to(onedir).as_posix()
             files[rel] = {"sha256": sha256_file(p), "size": p.stat().st_size}
     return files
@@ -59,14 +61,43 @@ def make_zip(src_dir: Path, zip_path: Path, only: set[str] | None = None) -> Non
                     z.write(p, rel)
 
 
+def package_info(archive: Path, base_url: str, chunk_bytes: int) -> dict:
+    info = {"url": f"{base_url}/{archive.name}", "size": archive.stat().st_size, "sha256": sha256_file(archive)}
+    parts = []
+    with archive.open("rb") as stream:
+        index = 1
+        while data := stream.read(chunk_bytes):
+            path = archive.with_name(f"{archive.name}.part{index:03}")
+            path.write_bytes(data)
+            parts.append({"url": f"{base_url}/{path.name}", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            index += 1
+    info["parts"] = parts
+    return info
+
+
+def build_installer(onedir: Path, out: Path, iscc: str, version: str) -> Path:
+    subprocess.run([iscc, "/Qp", f"/DAppVersion={version}", f"/DSourceDir={onedir}", f"/DOutputDir={out}", f"/DAppIcon={ROOT / 'assets/app.ico'}", str(ROOT / "tools/installer.iss")], check=True)
+    return out / f"reimburse-setup-v{version}.exe"
+
+
 def build_onedir(py: str, output_root: Path | None = None) -> Path:
     output_root = output_root or ROOT
+    (output_root / "build").mkdir(parents=True, exist_ok=True)
+    version_file = output_root / "build" / "version-info.txt"
+    numeric = tuple(int(part) for part in __version__.split(".")) + (0,)
+    version_file.write_text(
+        f"VSVersionInfo(ffi=FixedFileInfo(filevers={numeric!r}, prodvers={numeric!r}, mask=0x3f, flags=0, OS=0x40004, fileType=1, subtype=0, date=(0,0)), "
+        f"kids=[StringFileInfo([StringTable('040904B0', [StringStruct('FileDescription', {APP!r}), StringStruct('FileVersion', {__version__!r}), StringStruct('ProductVersion', {__version__!r}), StringStruct('ProductName', {APP!r}), StringStruct('OriginalFilename', {APP+'.exe'!r})])]), VarFileInfo([VarStruct('Translation', [1033,1200])])])",
+        encoding="utf-8",
+    )
     subprocess.run(
         [
             py, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--windowed",
             "--name", APP, "--icon", str(ROOT / "assets" / "app.ico"),
+            "--version-file", str(version_file),
             "--add-data", f"{ROOT / 'reimburse' / 'ocr_win.ps1'};reimburse",
             "--add-data", f"{ROOT / 'assets'};assets",
+            "--add-data", f"{ROOT / 'reimburse' / 'update_apply.ps1'};reimburse",
             "--collect-binaries", "pypdfium2", "--collect-submodules", "pypdfium2",
             "--collect-data", "docx", "--exclude-module", "numpy",
             "--exclude-module", "PIL.AvifImagePlugin", "--exclude-module", "PIL._avif",
@@ -88,7 +119,16 @@ def main() -> None:
     ap.add_argument("--python", default=DEFAULT_PY)
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--output-dir", type=Path, help="隔离的本地产物目录（不覆盖现有 dist/release_prep）")
+    ap.add_argument("--chunk-mb", type=int, default=4, help="下载分片大小，默认 4 MiB")
+    ap.add_argument("--installer", action="store_true", help="同时生成可卸载的每用户安装包")
+    ap.add_argument("--iscc", default=shutil.which("ISCC.exe"), help="Inno Setup 编译器路径")
     args = ap.parse_args()
+    if args.version != __version__:
+        ap.error("版本号必须与软件源码一致，请先更新 reimburse/__init__.py")
+    if not 1 <= args.chunk_mb <= 64:
+        ap.error("分片大小应在 1 至 64 MiB 之间")
+    if args.installer and (not args.iscc or not Path(args.iscc).is_file()):
+        ap.error("生成安装包需要有效的 --iscc 编译器路径")
 
     output_root = args.output_dir.resolve() if args.output_dir else ROOT
     if not args.skip_build:
@@ -101,6 +141,8 @@ def main() -> None:
 
     print("== 扫描文件清单 ==")
     files = scan_manifest(onedir)
+    files = validate_files(files)
+    (onedir / INSTALL_MANIFEST).write_text(json.dumps({"appId": APP_ID, "version": args.version, "files": files}, ensure_ascii=False, indent=2), encoding="utf-8")
     out = output_root / "release_prep"
     out.mkdir(exist_ok=True)
 
@@ -108,32 +150,40 @@ def main() -> None:
     print("== 打整包 ==")
     make_zip(onedir, full_zip)
     latest = {
+        "schema": 2,
+        "appId": APP_ID,
         "version": args.version,
         "releaseDate": datetime.now(timezone.utc).isoformat(),
         "notes": args.notes,
-        "full": {"url": f"{args.base_url}/{full_zip.name}", "size": full_zip.stat().st_size, "sha256": sha256_file(full_zip)},
+        "full": package_info(full_zip, args.base_url, args.chunk_mb * 1024**2),
     }
 
     if args.prev_manifest:
         prev = json.loads(Path(args.prev_manifest).read_text(encoding="utf-8"))
-        prev_files = prev.get("files", {})
+        prev_files = validate_files(prev.get("files", {}))
         prev_ver = prev.get("version", "")
         changed = {rel for rel, info in files.items() if prev_files.get(rel, {}).get("sha256") != info["sha256"]}
-        if changed and prev_ver and prev_ver != args.version:
+        removed = sorted(set(prev_files) - set(files))
+        if (changed or removed) and prev_ver and prev_ver != args.version:
             delta_zip = out / f"reimburse-delta-{prev_ver}-to-{args.version}.zip"
             print(f"== 打增量包（变化 {len(changed)} 个文件）==")
-            make_zip(onedir, delta_zip, only=changed)
-            latest["delta"] = {
+            make_zip(onedir, delta_zip, only=changed | {INSTALL_MANIFEST})
+            delta = {
                 "from": prev_ver,
-                "url": f"{args.base_url}/{delta_zip.name}",
-                "size": delta_zip.stat().st_size,
-                "sha256": sha256_file(delta_zip),
+                **package_info(delta_zip, args.base_url, args.chunk_mb * 1024**2),
                 "changed": len(changed),
+                "removed": removed,
+                "base_files": prev_files,
             }
+            latest["deltas"] = [delta]
+            latest["delta"] = delta  # Older clients can still download the ZIP.
         else:
             print("（无变化文件或版本相同，未生成增量包，客户端将用整包）")
 
     latest["files"] = files
+    if args.installer:
+        setup = build_installer(onedir, out, args.iscc, args.version)
+        latest["installer"] = {"url": f"{args.base_url}/{setup.name}", "size": setup.stat().st_size, "sha256": sha256_file(setup)}
     (out / "latest.json").write_text(json.dumps(latest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=" * 56)
@@ -143,7 +193,7 @@ def main() -> None:
         d = latest["delta"]
         print(f"增量：{d['url'].split('/')[-1]}  变化 {d['changed']} 个  {d['size'] / 1024 / 1024:.2f} MB  (from {d['from']})")
     print(f"清单：{out / 'latest.json'}")
-    print("把 release_prep/ 里的 latest.json 与 zip 上传到 release 即完成发布。")
+    print("本地准备完成，尚未上传或发布。将 latest.json、安装包、ZIP 及所有 .part 分片上传到同一正式 Release。")
 
 
 if __name__ == "__main__":

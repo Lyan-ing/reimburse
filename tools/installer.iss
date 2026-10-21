@@ -4,7 +4,16 @@
 ; 产物：dist\报销材料整理助手-setup-v<version>.exe
 #define AppName "报销材料整理助手"
 #ifndef AppVersion
-  #define AppVersion "2.2.0"
+  #define AppVersion "2.3.0"
+#endif
+#ifndef SourceDir
+  #define SourceDir SourcePath + "\..\dist\报销材料整理助手"
+#endif
+#ifndef OutputDir
+  #define OutputDir SourcePath + "\..\dist"
+#endif
+#ifndef AppIcon
+  #define AppIcon SourcePath + "\..\assets\app.ico"
 #endif
 #define AppExeName "报销材料整理助手.exe"
 ; 固定 AppId：保证后续版本被识别为同一软件、覆盖升级（勿改）
@@ -16,27 +25,31 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 DefaultDirName={localappdata}\Programs\{#AppName}
-AppUserModelID=ReimburseOrganizer.Desktop
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
-OutputDir={#SourcePath}\..\dist
-OutputBaseFilename={#AppName}-setup-v{#AppVersion}
+OutputDir={#OutputDir}
+OutputBaseFilename=reimburse-setup-v{#AppVersion}
+SetupIconFile={#AppIcon}
+UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
 ArchitecturesAllowed=x64
 PrivilegesRequired=lowest
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Default.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimplified"; MessagesFile: "{#SourcePath}\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"
 
 [Files]
 ; 把 dist\报销材料整理助手\（onedir：exe + _internal + 依赖）整个装进安装目录
-Source: "{#SourcePath}\..\dist\报销材料整理助手\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"; AppUserModelID: "ReimburseOrganizer.Desktop"

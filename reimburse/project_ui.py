@@ -282,7 +282,6 @@ class ProjectApp(tk.Tk):
         self._record_cards = {}
         self._asset_meta_labels = {}
         self._search_job = None
-        self._update_check_running = False
         self._generating = False
         self._ocr_jobs: set[tuple[str, str, str, str]] = set()
         self._asset_vars: dict[str, tk.StringVar] = {}
@@ -307,6 +306,7 @@ class ProjectApp(tk.Tk):
                 self.open_project(project)
         self.after(0, self._tick_clock)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(500, self._show_update_result)
 
     def px(self, value: int | float) -> int:
         return int(round(value * self.ui_scale))
@@ -424,8 +424,6 @@ class ProjectApp(tk.Tk):
                 if item[0] == "ocr":
                     _, project_id, record_id, slot, asset_id, data, error = item
                     self._apply_ocr(project_id, record_id, slot, asset_id, data, error)
-                elif item[0] == "update_checked":
-                    self._on_update_checked(item[1], item[2])
                 elif item[0] == "word_done":
                     self._on_word_generated(*item[1:])
         except queue.Empty:
@@ -587,6 +585,40 @@ class ProjectApp(tk.Tk):
         save_settings(self.settings)
         self.destroy()
 
+    def _show_update_result(self) -> None:
+        result = updater.read_update_result()
+        if not result:
+            return
+        if result.get("success"):
+            messagebox.showinfo("更新完成", f"已更新至 {result.get('version', '')}。\n报销资料和设置已保留。", parent=self)
+        else:
+            recovery = "已恢复旧版。" if result.get("rolledBack") and not result.get("rollbackError") else "安装文件未更改。"
+            if result.get("rollbackError"):
+                recovery = f"自动恢复未完成，旧版备份位于：{result.get('backup', '')}"
+            messagebox.showwarning("更新未完成", f"{result.get('error', '')}\n{recovery}", parent=self)
+
+    def _prepare_update_exit(self) -> None:
+        if self._generating:
+            raise RuntimeError("Word 正在生成，请完成后再安装更新。")
+        record = self._record()
+        if record is not None:
+            for key in ("amount", "payment_amount"):
+                raw = self.field_vars[key].get()
+                if raw.strip() and self._parse_amount(raw) is None:
+                    raise ValueError("请先修正当前记录中的无效金额，再安装更新。")
+            raw_date = self.field_vars["date"].get().strip()
+            if raw_date:
+                date.fromisoformat(raw_date)
+            for asset in record.slot_assets("payment"):
+                var = self._asset_vars.get(asset.id)
+                if var is not None:
+                    raw = var.get()
+                    if raw.strip() and self._parse_amount(raw) is None:
+                        raise ValueError("请先修正支付素材中的无效金额，再安装更新。")
+                    self._save_asset_amount(record, asset, raw)
+            self.save_fields(record)
+            self.project.save()
+
     def _schedule_search(self, *_args) -> None:
         if self._search_job is not None:
             self.after_cancel(self._search_job)
@@ -732,39 +764,11 @@ class ProjectApp(tk.Tk):
         UsageDialog(self)
 
     def _check_update_ui(self) -> None:
-        if self._update_check_running:
+        existing = getattr(self, "_update_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
             return
-        if updater.install_root() is None:
-            messagebox.showinfo(
-                "软件更新",
-                "当前是便携版（单文件 exe），不支持站内自动更新。\n"
-                "请到 gitee / github 下载新版覆盖即可。",
-                parent=self,
-            )
-            return
-
-        self._update_check_running = True
-        self.update_button.configure(text="检查中…", state="disabled")
-
-        def work() -> None:
-            try:
-                manifest = updater.check_update()
-                self.ui_queue.put(("update_checked", manifest, ""))
-            except Exception as exc:
-                self.ui_queue.put(("update_checked", None, str(exc)))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_update_checked(self, manifest, error: str = "") -> None:
-        self._update_check_running = False
-        self.update_button.configure(text="🔄 软件更新", state="normal")
-        if error:
-            messagebox.showwarning("暂时无法检查更新", f"{error}\n\n请稍后重试；报销资料可继续离线使用。", parent=self)
-            return
-        if manifest is None:
-            messagebox.showinfo("软件更新", "当前已是最新版本。", parent=self)
-            return
-        UpdateDialog(self, manifest)
+        self._update_window = UpdateDialog(self)
 
     def choose_workspace(self) -> None:
         folder = filedialog.askdirectory(title="选择报销台账目录", initialdir=str(self.workspace_root))
@@ -1997,131 +2001,239 @@ class CalculatorWindow(tk.Toplevel):
 
 
 class UpdateDialog(tk.Toplevel):
-    """软件更新对话框：显示更新说明与下载进度，确认后下载并替换重启。"""
+    """Check public releases from either mirror and explicitly install verified slices."""
 
-    def __init__(self, parent: tk.Widget, manifest: dict) -> None:
+    SOURCE_LABELS = {"自动（GitHub / Gitee）": "auto", "GitHub": "github", "Gitee": "gitee"}
+
+    def __init__(self, parent: tk.Widget, manifest: dict | None = None):
         super().__init__(parent)
+        self.owner = parent
         self.manifest = manifest
         self.events = queue.Queue()
         self._busy = False
+        self._checking = False
+        self._poll_job = None
+        self._check_job = None
         self.title("软件更新")
         self.configure(bg=COLORS["bg"])
         self.resizable(False, False)
         self.transient(parent)
         scale = float(getattr(parent, "ui_scale", 1.0) or 1.0)
-        wrap = int(420 * scale)
-
-        card = tk.Frame(self, bg=COLORS["panel"], highlightbackground=COLORS["line"], highlightthickness=1)
-        card.pack(fill="both", expand=True, padx=int(14 * scale), pady=int(14 * scale))
-        inner = tk.Frame(card, bg=COLORS["panel"], padx=int(20 * scale), pady=int(18 * scale))
-        inner.pack(fill="both", expand=True)
-
-        tk.Label(inner, text="发现新版本", font=("Microsoft YaHei UI", 13, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(anchor="w")
-        tk.Label(
-            inner,
-            text=f"当前 {__version__}   →   最新 {manifest.get('version', '')}",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            fg=COLORS["accent"],
-            bg=COLORS["panel"],
-        ).pack(anchor="w", pady=(4, 8))
-        notes = (manifest.get("notes") or "").strip() or "（作者未填写更新说明）"
-        tk.Label(
-            inner, text=notes, justify="left", anchor="nw", wraplength=wrap,
-            font=("Microsoft YaHei UI", 9), fg=COLORS["ink"], bg=COLORS["panel"],
-        ).pack(anchor="w", fill="x")
-
-        self.progress = ttk.Progressbar(inner, mode="determinate", maximum=100, length=int(360 * scale))
-        self.pct = tk.Label(inner, text="", font=("Microsoft YaHei UI", 8), fg=COLORS["muted"], bg=COLORS["panel"])
-
-        btns = tk.Frame(inner, bg=COLORS["panel"])
-        btns.pack(fill="x", pady=(16, 0))
-        self.update_btn = ttk.Button(btns, text="立即更新", style="Accent.TButton", command=self._start)
+        self._scale = scale
+        panel = tk.Frame(self, bg=COLORS["panel"], padx=int(22*scale), pady=int(18*scale))
+        panel.pack(fill="both", expand=True, padx=int(14*scale), pady=int(14*scale))
+        tk.Label(panel, text="软件更新", font=("Microsoft YaHei UI", 14, "bold"), fg=COLORS["ink"], bg=COLORS["panel"]).pack(anchor="w")
+        tk.Label(panel, text=f"当前版本 {__version__}  ·  {updater.run_mode()}", fg=COLORS["muted"], bg=COLORS["panel"]).pack(anchor="w", pady=(4, 12))
+        row = tk.Frame(panel, bg=COLORS["panel"])
+        row.pack(fill="x")
+        tk.Label(row, text="更新源", fg=COLORS["muted"], bg=COLORS["panel"]).pack(side="left", padx=(0, 8))
+        preferred = getattr(parent, "settings", {}).get("update_source", "auto")
+        self.source_var = tk.StringVar(value=next((label for label, key in self.SOURCE_LABELS.items() if key == preferred), next(iter(self.SOURCE_LABELS))))
+        self.source_box = ttk.Combobox(row, textvariable=self.source_var, values=list(self.SOURCE_LABELS), state="readonly", width=24)
+        self.source_box.pack(side="left")
+        self.check_btn = ttk.Button(row, text="检查更新", style="Soft.TButton", command=self._check)
+        self.check_btn.pack(side="right", padx=(12, 0))
+        self.status_var = tk.StringVar(value="准备检查正式发布版本…")
+        self.status_label = tk.Label(panel, textvariable=self.status_var, font=("Microsoft YaHei UI", 10, "bold"), fg=COLORS["accent"], bg=COLORS["panel"], wraplength=int(470*scale), justify="left")
+        self.status_label.pack(anchor="w", fill="x", pady=(16, 7))
+        self.detail_var = tk.StringVar(value="自动源会并行检测两个仓库，选择最新的可安装版本。")
+        tk.Label(panel, textvariable=self.detail_var, font=("Microsoft YaHei UI", 9), fg=COLORS["muted"], bg=COLORS["panel"], wraplength=int(470*scale), justify="left").pack(anchor="w", fill="x", pady=(0, 10))
+        self.notes = tk.Text(panel, width=54, height=7, wrap="word", font=("Microsoft YaHei UI", 9), bg=COLORS["bg"], fg=COLORS["ink"], relief="flat", padx=10, pady=8, state="disabled")
+        self.notes.pack(fill="x")
+        self.progress = ttk.Progressbar(panel, mode="determinate", maximum=100)
+        self.pct = tk.Label(panel, text="", fg=COLORS["muted"], bg=COLORS["panel"])
+        buttons = tk.Frame(panel, bg=COLORS["panel"])
+        buttons.pack(fill="x", pady=(14, 0))
+        self.update_btn = ttk.Button(buttons, text="下载并安装", state="disabled", style="Accent.TButton", command=self._start)
         self.update_btn.pack(side="left")
-        self.cancel_btn = ttk.Button(btns, text="取消", style="Soft.TButton", command=self._close)
-        self.cancel_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="打开发布页", style="Soft.TButton", command=self._open_release).pack(side="left", padx=(8, 0))
+        self.cancel_btn = ttk.Button(buttons, text="关闭", style="Soft.TButton", command=self._close)
+        self.cancel_btn.pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self._close)
-
+        self.bind("<Escape>", lambda _event: self._close())
         self._center(parent)
         self.grab_set()
-        self.after(100, self._poll_events)
+        self._poll_job = self.after(100, self._poll_events)
+        if manifest is not None:
+            self._show_manifest(manifest)
+        else:
+            self._check_job = self.after(120, self._check)
 
-    def _close(self) -> None:
+    def destroy(self):
+        for job in (self._poll_job, self._check_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+        super().destroy()
+
+    def _center(self, parent):
+        self.update_idletasks()
+        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width()-width)//2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height()-height)//2)
+        x = max(0, min(x, self.winfo_screenwidth()-width-20))
+        y = max(0, min(y, self.winfo_screenheight()-height-40))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _set_notes(self, text):
+        self.notes.configure(state="normal")
+        self.notes.delete("1.0", "end")
+        self.notes.insert("1.0", text)
+        self.notes.configure(state="disabled")
+
+    def _check(self):
+        if self._busy or self._checking:
+            return
+        self._checking = True
+        self.manifest = None
+        self.check_btn.configure(state="disabled", text="检查中…")
+        self.update_btn.configure(state="disabled")
+        self.source_box.configure(state="disabled")
+        self.status_var.set("正在检测最新版…")
+        self.status_label.configure(fg=COLORS["accent"])
+        self.detail_var.set("只读取公开版本信息，不上传报销资料。")
+        source = self.SOURCE_LABELS[self.source_var.get()]
+        if hasattr(self.owner, "settings"):
+            self.owner.settings["update_source"] = source
+            save_settings(self.owner.settings)
+        def worker():
+            try:
+                manifest = updater.check_latest(source)
+                self.events.put(("checked", manifest))
+            except updater.ReleaseUnavailable as exc:
+                self.events.put(("unpublished", str(exc)))
+            except Exception as exc:
+                self.events.put(("check_error", str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_check(self):
+        self._checking = False
+        self.check_btn.configure(state="normal", text="重新检查")
+        self.source_box.configure(state="readonly")
+
+    def _show_manifest(self, manifest):
+        self._finish_check()
+        self.manifest = manifest
+        source = updater.SOURCES.get(manifest.get("_source"), {}).get("name", "发布服务器")
+        newer = updater._version_gt(manifest["version"], __version__)
+        self.status_label.configure(fg=COLORS["accent"] if newer else COLORS["leaf"])
+        if newer:
+            self.status_var.set(f"发现新版本 {manifest['version']}")
+        elif updater._version_gt(__version__, manifest["version"]):
+            self.status_var.set(f"本机版本较新（已发布版本：{manifest['version']}）")
+        else:
+            self.status_var.set(f"当前已是最新版本（服务器：{manifest['version']}）")
+        self._set_notes(str(manifest.get("notes") or "本版本未提供更新说明。"))
+        if not newer:
+            self.detail_var.set(f"来源：{source}。无需下载或安装。")
+            self.update_btn.configure(state="disabled")
+            return
+        package, mode = updater.select_package(manifest, verify_base=False)
+        count = len(package.get("parts", [])) or 1
+        size = package["size"] / 1024**2
+        self.detail_var.set(f"来源：{source}  ·  {mode}，约 {size:.2f} MiB / {count} 个分片。\n下载可续传；安装前校验基线，必要时改用完整包；失败恢复旧版。")
+        if updater.install_root() is None:
+            self.update_btn.configure(text="下载安装包", state="normal" if manifest.get("installer") else "disabled")
+            self.detail_var.set(self.detail_var.get() + "\n当前模式不能就地安装，请先下载安装版。")
+        else:
+            self.update_btn.configure(text="下载并安装（重启）", state="normal")
+
+    def _open_release(self):
+        import webbrowser
+        source = self.SOURCE_LABELS[self.source_var.get()]
+        url = self.manifest.get("_release_url") if self.manifest else None
+        webbrowser.open(url or updater.SOURCES.get(source, updater.SOURCES["github"])["page"])
+
+    def _close(self):
         if not self._busy:
             self.destroy()
 
-    def _poll_events(self) -> None:
-        latest_progress = None
-        try:
-            while True:
-                kind, payload = self.events.get_nowait()
-                if kind == "error":
-                    self._failed(payload)
-                    latest_progress = None
-                else:
-                    latest_progress = payload
-        except queue.Empty:
-            pass
-        if latest_progress is not None:
-            self._set_progress(*latest_progress)
-        self.after(100, self._poll_events)
-
-    def _center(self, parent: tk.Widget) -> None:
-        self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
-        parent.update_idletasks()
-        px = parent.winfo_rootx()
-        py = parent.winfo_rooty()
-        pw = max(parent.winfo_width(), 640)
-        ph = max(parent.winfo_height(), 480)
-        x = px + max(0, (pw - w) // 2)
-        y = py + max(0, (ph - h) // 2)
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        x = max(0, min(x, max(0, sw - w - 20)))
-        y = max(0, min(y, max(0, sh - h - 60)))
-        self.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _resize(self) -> None:
-        self.update_idletasks()
-        h = self.winfo_reqheight()
-        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self.geometry())
-        if m:
-            self.geometry(f"{m.group(1)}x{h}+{m.group(3)}+{m.group(4)}")
-
-    def _start(self) -> None:
-        if self._busy:
+    def _start(self):
+        if self._busy or self.manifest is None:
+            return
+        if updater.install_root() is None:
+            import webbrowser
+            installer = self.manifest.get("installer")
+            if installer:
+                webbrowser.open(updater._urls(installer, self.manifest)[0])
+            return
+        if getattr(self.owner, "_generating", False):
+            messagebox.showinfo("请稍候", "Word 正在生成，完成后再安装更新。", parent=self)
             return
         self._busy = True
         self.update_btn.configure(state="disabled")
         self.cancel_btn.configure(state="disabled")
-        self.progress.pack(fill="x", pady=(12, 2))
+        self.check_btn.configure(state="disabled")
+        self.source_box.configure(state="disabled")
+        self.progress.pack(fill="x", pady=(10, 0))
         self.pct.pack(anchor="w")
         self._resize()
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _set_progress(self, done: int, total: int) -> None:
-        pct = int(done * 100 / total) if total else 0
-        self.progress["value"] = pct
-        self.pct.configure(text=f"下载中 {pct}%（{done // 1024} / {total // 1024} KB）")
-        self._resize()
-
-    def _worker(self) -> None:
+    def _worker(self):
         try:
-            updater.apply_update(
-                self.manifest,
-                on_progress=lambda d, t: self.events.put(("progress", (d, t))),
-            )
-        except Exception as exc:  # 下载/校验失败：提示且不退出、不改动文件
+            plan = updater.prepare_update(self.manifest,
+                on_progress=lambda done, total: self.events.put(("progress", (done, total))),
+                on_status=lambda status: self.events.put(("status", status)))
+            self.events.put(("ready", plan))
+        except Exception as exc:
             self.events.put(("error", str(exc)))
 
-    def _failed(self, msg: str) -> None:
+    def _poll_events(self):
+        progress = None
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "checked":
+                    self._show_manifest(payload)
+                elif kind in {"unpublished", "check_error"}:
+                    self._finish_check()
+                    self.status_label.configure(fg=COLORS["warn"])
+                    self.status_var.set("暂无可安装版本" if kind == "unpublished" else "暂时无法检查更新")
+                    self.detail_var.set("可切换 GitHub / Gitee 后重试；离线整理功能仍可使用。")
+                    self._set_notes(payload)
+                elif kind == "progress":
+                    progress = payload
+                elif kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "ready":
+                    try:
+                        self.owner._prepare_update_exit()
+                        updater.launch_prepared_update(payload)
+                    except Exception as exc:
+                        self._failed(str(exc))
+                        continue
+                    self.owner._on_close()
+                    return
+                elif kind == "error":
+                    progress = None
+                    self._failed(payload)
+        except queue.Empty:
+            pass
+        if progress is not None:
+            self._set_progress(*progress)
+        self._poll_job = self.after(100, self._poll_events)
+
+    def _set_progress(self, done, total):
+        percentage = min(100, int(done * 100 / total)) if total else 0
+        self.progress["value"] = percentage
+        self.pct.configure(text=f"下载 {percentage}%  ·  {done/1024**2:.2f} / {total/1024**2:.2f} MiB")
+
+    def _resize(self):
+        self.update_idletasks()
+        self.geometry(f"{self.winfo_width()}x{self.winfo_reqheight()}")
+
+    def _failed(self, message):
         self._busy = False
+        self.status_var.set("安装未开始，可重试")
+        self.detail_var.set("已保留通过校验的分片和下载断点，本地安装文件尚未改动。")
         self.update_btn.configure(state="normal")
         self.cancel_btn.configure(state="normal")
-        self.progress.pack_forget()
-        self.pct.pack_forget()
-        messagebox.showerror("更新失败", msg, parent=self)
+        self.check_btn.configure(state="normal")
+        self.source_box.configure(state="readonly")
+        messagebox.showerror("更新未完成", message, parent=self)
 
 
 class UsageDialog(tk.Toplevel):
