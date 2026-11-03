@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -115,6 +116,18 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> li
     return lines
 
 
+def _material_key(material: Material) -> str:
+    """Stable, unique temp-file key for a material.
+
+    Materials imported from a project do not always have source_hash set.
+    Falling back to a constant such as "pdf" made every PDF render to the same
+    file, so the last PDF silently replaced earlier ones in the document.
+    """
+    if material.source_hash:
+        return material.source_hash[:12]
+    return hashlib.sha1(str(material.path).encode("utf-8")).hexdigest()[:12]
+
+
 def make_placeholder(material: Material, output: Path, reason: str = "") -> Path:
     width, height = 1654, 2339
     image = Image.new("RGB", (width, height), "white")
@@ -183,7 +196,7 @@ class PreviewRenderer:
                 if img.width > max_width:
                     ratio = max_width / img.width
                     img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
-                out = self.temp_dir / f"{material.source_hash[:12] or 'img'}_{abs(hash(material.uid)) & 0xFFFFFF}.png"
+                out = self.temp_dir / f"{_material_key(material)}_{abs(hash(material.uid)) & 0xFFFFFF}.png"
                 img.save(out, "PNG")
                 self._cache[key] = out
                 return out
@@ -216,7 +229,7 @@ class PreviewRenderer:
                     if pil_image.width > 1900:
                         ratio = 1900 / pil_image.width
                         pil_image = pil_image.resize((1900, int(pil_image.height * ratio)), Image.LANCZOS)
-                    out = self.temp_dir / f"{material.source_hash[:12] or 'pdf'}_p{index}.png"
+                    out = self.temp_dir / f"{_material_key(material)}_p{index}.png"
                     pil_image.save(out, "PNG")
                     outputs.append(out)
             finally:
@@ -291,15 +304,6 @@ def _blocks_for_group(group: ExpenseGroup, renderer: PreviewRenderer) -> list[Im
             for page in renderer.pages(material):
                 blocks.append(_make_stack_block([page], FULL_IMAGE_WIDTH_CM, label=group.gid))
         return blocks
-    if group.section == "other" and group.subtype == "purchase":
-        blocks: list[ImageBlock] = []
-        if group.invoice:
-            blocks.extend(_make_stack_block([p], FULL_IMAGE_WIDTH_CM, label=group.gid) for p in renderer.pages(group.invoice))
-        for photo in group.photos:
-            for page in renderer.pages(photo):
-                blocks.append(_make_stack_block([page], FULL_IMAGE_WIDTH_CM, label=group.gid))
-        if blocks:
-            return blocks
     blocks: list[ImageBlock] = []
     for material in materials:
         if material.role == "payment":
@@ -480,8 +484,11 @@ def _add_page_break(doc: Document) -> None:
     run.add_break(WD_BREAK.PAGE)
 
 
-def build_document(result: ScanResult, output_path: Path) -> Path:
-    output_path = unique_output_path(output_path)
+def build_document(result: ScanResult, output_path: Path, *, overwrite: bool = False) -> Path:
+    if not overwrite:
+        output_path = unique_output_path(output_path)
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     renderer = PreviewRenderer()
     try:
         doc = Document()
@@ -531,6 +538,14 @@ def build_document(result: ScanResult, output_path: Path) -> Path:
                 for page in _pack_half_blocks(payment_blocks):
                     flat = [block for row in page for block in row]
                     pages.append(("payment", flat, False))
+
+        # “其他材料”统一放在所有支付记录之后，录用通知之前。
+        appendix_blocks: list[ImageBlock] = []
+        for group in [g for g in result.groups if g.section == "appendix"]:
+            appendix_blocks.extend(_blocks_for_group(group, renderer))
+        if appendix_blocks:
+            for page in _pack_full_blocks(appendix_blocks):
+                pages.append(("appendix", page, True))
 
         # 录用通知放在最后。
         notice_blocks: list[ImageBlock] = []

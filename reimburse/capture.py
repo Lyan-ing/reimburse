@@ -8,10 +8,9 @@ import time
 import tkinter as tk
 from typing import Callable
 
-from PIL import Image, ImageGrab
-
-
 def clipboard_image() -> Image.Image | None:
+    from PIL import Image, ImageGrab
+
     try:
         value = ImageGrab.grabclipboard()
     except Exception:
@@ -22,6 +21,8 @@ def clipboard_image() -> Image.Image | None:
 
 
 def clipboard_files() -> list[str]:
+    from PIL import ImageGrab
+
     try:
         value = ImageGrab.grabclipboard()
     except Exception:

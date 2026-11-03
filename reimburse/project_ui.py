@@ -13,8 +13,6 @@ from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
-
 from .capture import ScreenCapturer, clipboard_files, clipboard_image
 from . import __version__, updater
 from .appearance import COLORS, apply_window_icon, enable_dpi_awareness
@@ -294,16 +292,18 @@ class ProjectApp(tk.Tk):
         self.count_var = tk.StringVar(value="")
 
         self._configure_style()
+        self._initial_project = self.workspace.find(self.settings.get("last_project_id", ""))
+        self._startup_restore_job = None
+        if self._initial_project is not None:
+            self.project = self._initial_project
+            self.current_record_id = self.settings.get("last_project_record", "") or None
         self._build_shell()
         self._refresh_projects()
         self.after(100, self._poll_ui_queue)
-        last_id = self.settings.get("last_project_id", "")
-        last_record = self.settings.get("last_project_record", "")
-        if last_id:
-            project = self.workspace.find(last_id)
-            if project:
-                self.current_record_id = last_record or None
-                self.open_project(project)
+        if self._initial_project is not None:
+            previous = self._initial_project
+            self._startup_restore_job = self.after(60, lambda: self._restore_startup_project(previous))
+        del self._initial_project
         self.after(0, self._tick_clock)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(500, self._show_update_result)
@@ -495,7 +495,10 @@ class ProjectApp(tk.Tk):
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.rowconfigure(0, weight=1)
         self.content.columnconfigure(0, weight=1)
-        self._render_empty()
+        if self._initial_project is None:
+            self._render_empty()
+        else:
+            tk.Label(self.content, text="正在恢复上次项目…", font=("Microsoft YaHei UI", 10), fg=COLORS["muted"], bg=COLORS["bg"]).pack(anchor="nw", padx=self.px(20), pady=self.px(24))
 
     def _update_workspace_btn(self) -> None:
         # 顶栏只显示功能名，不直接暴露实际存放路径（路径设置见 choose_workspace）。
@@ -573,6 +576,7 @@ class ProjectApp(tk.Tk):
         ttk.Button(wrap, text="＋ 新建报销项目", style="Accent.TButton", command=self.new_project).pack(pady=(16, 0))
 
     def _on_close(self) -> None:
+        self._cancel_startup_restore()
         self.settings.update(
             {
                 "workspace_root": str(self.workspace_root),
@@ -774,6 +778,7 @@ class ProjectApp(tk.Tk):
         folder = filedialog.askdirectory(title="选择报销台账目录", initialdir=str(self.workspace_root))
         if not folder:
             return
+        self._cancel_startup_restore()
         self.workspace_root = Path(folder)
         self.workspace = Workspace(self.workspace_root)
         self.project = None
@@ -802,7 +807,19 @@ class ProjectApp(tk.Tk):
         self._refresh_projects()
         self.open_project(project)
 
-    def open_project(self, project: Project) -> None:
+    def _cancel_startup_restore(self) -> None:
+        if self._startup_restore_job is not None:
+            self.after_cancel(self._startup_restore_job)
+            self._startup_restore_job = None
+
+    def _restore_startup_project(self, project: Project) -> None:
+        self._startup_restore_job = None
+        # An explicit project/workspace choice takes precedence over restoration.
+        if self.project is project:
+            self.open_project(project, refresh_sidebar=False)
+
+    def open_project(self, project: Project, *, refresh_sidebar: bool = True) -> None:
+        self._cancel_startup_restore()
         self.project = project
         self.project.sort_records()
         if self.current_record_id and not project.find_record(self.current_record_id):
@@ -811,7 +828,8 @@ class ProjectApp(tk.Tk):
             self.current_record_id = project.records[0].id
         self.settings["last_project_id"] = project.id
         self._render_project()
-        self._refresh_projects()
+        if refresh_sidebar:
+            self._refresh_projects()
 
     def _render_project(self) -> None:
         if self.content is None or self.project is None:
@@ -1391,6 +1409,8 @@ class ProjectApp(tk.Tk):
             self._thumb_refs.move_to_end(key)
             return self._thumb_refs[key]
         try:
+            from PIL import Image, ImageTk
+
             image = None
             if path.suffix.lower() == ".pdf":
                 try:

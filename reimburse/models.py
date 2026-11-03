@@ -12,6 +12,7 @@ SECTION_ORDER: dict[str, int] = {
     "taxi": 30,
     "other": 40,
     "payment": 50,
+    "appendix": 55,
     "notice": 60,
 }
 
@@ -21,6 +22,7 @@ SECTION_NAMES: dict[str, str] = {
     "taxi": "打车交通票据",
     "other": "其他票据",
     "payment": "支付记录",
+    "appendix": "其他材料",
     "notice": "会议通知/录用通知",
 }
 

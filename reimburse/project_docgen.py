@@ -4,9 +4,9 @@ import re
 from datetime import date
 from pathlib import Path
 
-from .docgen import build_document, default_filename, unique_output_path
+from .docgen import build_document
 from .models import ExpenseGroup, Material, Reminder, SECTION_ORDER, ScanResult
-from .project_models import Asset, Project, Record, SLOT_LABELS, sanitize_filename
+from .project_models import Asset, Project, Record, sanitize_filename
 
 
 def _record_subtype(record: Record) -> str:
@@ -75,7 +75,7 @@ def to_scan_result(project: Project) -> ScanResult:
         order += 1
         first_invoice = True
         first_payment = True
-        for key in ("invoice", "payment", "itinerary", "toll", "photo", "other"):
+        for key in ("invoice", "payment", "itinerary", "toll", "photo"):
             assets = record.slot_assets(key)
             for asset in assets:
                 if not asset.rel_path:
@@ -130,6 +130,29 @@ def to_scan_result(project: Project) -> ScanResult:
             if notice_group.materials:
                 groups.append(notice_group)
 
+        # Misc "其他材料" is an appendix: it must appear after all payment
+        # records, not next to the invoice.
+        other_assets = record.slot_assets("other")
+        if other_assets:
+            appendix_group = ExpenseGroup(
+                gid=f"{record.id}_appendix",
+                section="appendix",
+                subtype="other_material",
+                date=record.business_date,
+                title=f"{record.display_title} 其他材料",
+                order=order,
+            )
+            order += 1
+            for asset in other_assets:
+                if not asset.rel_path:
+                    continue
+                material = _asset_material(project, record, asset, "unknown")
+                material.section = "appendix"
+                materials.append(material)
+                appendix_group.materials.append(material)
+            if appendix_group.materials:
+                groups.append(appendix_group)
+
     groups.sort(key=lambda g: (SECTION_ORDER.get(g.section, 99), g.date or date.max, g.order))
 
     reminders = [
@@ -180,8 +203,7 @@ def build_project_document(project: Project, output_path: Path | None = None, *,
     project.ensure_dirs()
     result = to_scan_result(project)
     path = output_path or (project.output_dir / project_filename(project))
-    path = unique_output_path(path)
-    generated = build_document(result, path)
+    generated = build_document(result, path, overwrite=True)
     if save_metadata:
         try:
             rel = generated.relative_to(project.folder).as_posix()

@@ -7,10 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
 import uuid
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 from . import __version__
@@ -37,9 +34,13 @@ def run_mode() -> str:
     return "安装版 / 目录版" if install_root() is not None else ("单文件便携版" if getattr(sys, "frozen", False) else "源码开发版")
 
 def _request(url, headers=None):
+    import urllib.request
+
     return urllib.request.Request(quote(valid_url(url), safe=":/?&=%"), headers={"User-Agent": "ReimburseOrganizer-Updater/2", "Accept": "application/json", **(headers or {})})
 
 def _get_json(url):
+    import urllib.request
+
     with urllib.request.urlopen(_request(url), timeout=NET_TIMEOUT) as response:
         raw = response.read(8 * 1024 * 1024 + 1)
     if len(raw) > 8 * 1024 * 1024:
@@ -47,6 +48,8 @@ def _get_json(url):
     return json.loads(raw.decode("utf-8-sig"))
 
 def _download(url, dest, on_progress=None, *, expected_size=None):
+    import urllib.request
+
     partial = dest.with_name(dest.name + ".part")
     offset = partial.stat().st_size if partial.exists() else 0
     if expected_size is not None and offset >= expected_size:
@@ -140,6 +143,8 @@ def _source_manifest(source):
     raise ReleaseUnavailable(f"{SOURCES[source]['name']} 暂无带更新附件的正式 Release")
 
 def check_latest(source="auto"):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     names = list(SOURCES) if source == "auto" else [source]
     if any(name not in SOURCES for name in names):
         raise ValueError("未知更新源")
@@ -237,6 +242,8 @@ def _download_package(package, manifest, cache, on_progress=None):
     return complete
 
 def _extract_verified(archive, staging, manifest, root):
+    import zipfile
+
     changes, seen = [], set()
     with zipfile.ZipFile(archive) as package:
         for entry in package.infolist():
@@ -266,6 +273,8 @@ def _extract_verified(archive, staging, manifest, root):
     return changes
 
 def prepare_update(manifest, on_progress=None, on_status=None, *, root=None, cache_dir=None):
+    import zipfile
+
     manifest = {**validate_manifest(manifest), **{k: v for k, v in manifest.items() if k.startswith("_")}}
     root = root if root is not None else install_root()
     if root is None:

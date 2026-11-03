@@ -35,14 +35,15 @@ def asset_path(name: str) -> Path:
 
 def apply_window_icon(window) -> None:
     """Set both Windows ICO and Tk's inherited icon for dialogs."""
-    from PIL import Image, ImageTk
+    import tkinter as tk
 
     icon = asset_path("app.ico")
     png = asset_path("app.png")
     if icon.exists():
         window.iconbitmap(default=str(icon))
     if png.exists():
-        with Image.open(png) as image:
-            image.thumbnail((64, 64), Image.Resampling.LANCZOS)
-            window._app_icon = ImageTk.PhotoImage(image.copy(), master=window)
+        # Decode and scale the bundled icon with Tk, without importing Pillow.
+        source = tk.PhotoImage(file=str(png), master=window)
+        factor = max(1, (max(source.width(), source.height()) + 63) // 64)
+        window._app_icon = source.subsample(factor, factor)
         window.iconphoto(True, window._app_icon)

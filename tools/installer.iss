@@ -4,7 +4,7 @@
 ; 产物：dist\reimburse-setup-v<version>.exe
 #define AppName "报销材料整理助手"
 #ifndef AppVersion
-  #define AppVersion "2.3.0"
+  #define AppVersion "2.3.1"
 #endif
 #ifndef SourceDir
   #define SourceDir SourcePath + "\..\dist\报销材料整理助手"
